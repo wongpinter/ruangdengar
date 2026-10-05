@@ -90,6 +90,7 @@ class TrackMeta:
 
     # --- bookkeeping --------------------------------------------------------
     error: str | None = None
+    retryable_error: bool = False
     fetched_bytes: int = 0
     fetch_requests: int = 0
 

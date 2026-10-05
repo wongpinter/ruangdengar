@@ -67,3 +67,39 @@ npm run build
 uv sync --extra web
 # Restart the RuangDengar service with its configured environment.
 ```
+
+
+## Backend state and upgrade notes
+
+Run one application process/worker per database and cache. Scanner locks, SSE events,
+credential-file synchronization, and cache eviction are coordinated within that process;
+multiple Uvicorn workers or replicas sharing these paths are not supported.
+
+Before upgrading, stop the service and back up the SQLite database. Keep its parent
+directory private to the service user (`chmod 700 data`). The app enforces mode 600 on
+its database and writes credential files atomically with private permissions. Backups
+contain OAuth secrets and must be protected the same way.
+
+The backend audit fixes migrate existing track-to-book identities and manual metadata
+into dedicated tables on startup. Existing valid book IDs are retained when their Drive
+tracks are rediscovered. New books receive opaque IDs; folder or album renames retain
+identity through the track mapping. Previously empty IDs are repaired automatically.
+Previously merged books cannot have their personal state unambiguously divided; when
+separated, the existing state follows one matched book and the others get new IDs.
+Tagged editions in distinct directories are grouped separately; `Disc 1` / `CD 2`
+subfolders under an edition remain one book.
+
+A scan persists per-file checkpoints without replacing the live library. Only its final
+publication reconciles books, tracks, and dependent personal state. Interrupted or failed
+scans leave the current library available. Removing a book at successful publication
+removes its favorites, rating, tags, playlist memberships, history, and progress; manual
+metadata overrides and track identity mappings are retained for rediscovery. Removing
+just the saved progress track clears that checkpoint. A failed probe of an existing
+track retains its last successful metadata and reports the scan error.
+
+Existing browser sessions need to sign in again after this upgrade. Sign-out invalidates
+all sessions for this single-user app and fences old credential workers. It does not
+revoke the Google OAuth grant; revoke that separately in your Google account if needed.
+Cache checksums are verified before new entries are published. Existing cache entries
+created before this upgrade should be cleared once, while the service is stopped, to
+ensure they were verified by the new writer.
