@@ -21,6 +21,7 @@ def config(tmp_path: Path) -> WebConfig:
     result.client_secrets = tmp_path / "client.json"
     result.folder_id = "folder-id"
     result.db_path = tmp_path / "library.sqlite3"
+    result.credentials_path = tmp_path / "credentials.json"
     result.cache_path = tmp_path / "media-cache"
     result.cache_max_bytes = 1024
     return result
@@ -50,8 +51,8 @@ def test_media_cache_uses_md5_and_evicts_oldest(tmp_path: Path) -> None:
     from audioscan.web import MediaCache
 
     cache = MediaCache(tmp_path / "cache", max_bytes=8)
-    first = {"id": "one", "name": "one.m4b", "md5": "abc", "modified": "today", "size": 5}
-    second = {"id": "two", "name": "two.mp3", "md5": "def", "modified": "today", "size": 5}
+    first = {"id": "one", "name": "one.m4b", "md5": "827ccb0eea8a706c4c34a16891f84e7b", "modified": "today", "size": 5}
+    second = {"id": "two", "name": "two.mp3", "md5": "ab56b4d92b40713acc5af89985d4b786", "modified": "today", "size": 5}
     path = cache.put(first, iter([b"12345"]))
     assert path is not None and cache.file(first) == path
     assert next(cache.serve(path, 1, 3)) == b"234"
@@ -113,7 +114,7 @@ def sign_in(client: TestClient) -> None:
     signer = TimestampSigner(middleware.kwargs["secret_key"])
     from base64 import b64encode
 
-    cookie = signer.sign(b64encode(json.dumps({"email": "reader@example.com"}).encode())).decode()
+    cookie = signer.sign(b64encode(json.dumps({"email": "reader@example.com", "generation": client.app.state.db.auth_generation()}).encode())).decode()
     client.cookies.set("session", cookie)
 
 
@@ -807,7 +808,7 @@ def test_scan_subscription_does_not_replay_an_old_completion(tmp_path: Path) -> 
     endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/api/library/events")
 
     class FakeRequest:
-        session = {"email": cfg.allowed_email}
+        session = {"email": cfg.allowed_email, "generation": app.state.db.auth_generation()}
 
         async def is_disconnected(self) -> bool:
             return False

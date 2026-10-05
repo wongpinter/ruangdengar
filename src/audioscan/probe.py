@@ -402,7 +402,10 @@ def probe(
     try:
         audio = mutagen.File(fileobj)
     except Exception as exc:
+        from .reader import FetchError
+
         meta.error = f"{type(exc).__name__}: {exc}"
+        meta.retryable_error = isinstance(exc, FetchError)
         return meta
 
     if audio is None:

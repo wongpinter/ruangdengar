@@ -8,6 +8,7 @@ files back into books and reports gaps and duplicates.
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 from collections import Counter
@@ -281,17 +282,23 @@ def _group_identity(track: TrackMeta, parsed: ParsedName) -> tuple[str, str]:
     album = (track.album or "").strip()
     if album:
         album_artist = (track.albumartist or track.artist or "").strip()
-        return normalize_key(f"{album_artist}|{album}"), album
+        parent = posixpath.dirname((track.path or "").replace("\\", "/"))
+        # Disc subfolders belong to their edition, not to separate books.
+        if re.fullmatch(r"(?:disc|disk|cd)[ _.-]*\d+", posixpath.basename(parent), re.I):
+            parent = posixpath.dirname(parent)
+        return json.dumps(["album", parent, album_artist, album], ensure_ascii=False), album
 
     path = (track.path or "").replace("\\", "/")
     parent = posixpath.dirname(path)
     if parent:
-        return normalize_key(parent), posixpath.basename(parent) or parent
+        return json.dumps(["folder", parent], ensure_ascii=False), posixpath.basename(
+            parent
+        ) or parent
 
     if parsed.book:
-        return normalize_key(parsed.book), parsed.book
+        return json.dumps(["name", parsed.book], ensure_ascii=False), parsed.book
 
-    return normalize_key(track.id or track.name), track.display_title
+    return json.dumps(["track", track.id or track.name], ensure_ascii=False), track.display_title
 
 
 def _sort_key(item: GroupedTrack) -> tuple[int, int, str]:

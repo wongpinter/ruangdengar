@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,9 +15,9 @@ import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, BinaryIO
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -28,7 +29,10 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.types import Receive, Scope, Send
 
 from .models import SOURCE_GDRIVE, Chapter, Cover, TrackMeta
 from .naming import group_tracks
@@ -39,6 +43,93 @@ from .sources.gdrive import DRIVE_API, DRIVE_READONLY_SCOPE, DriveError, DriveSo
 from .sources.http import HttpRangeFetcher
 
 logger = logging.getLogger(__name__)
+
+
+class RequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProgressBody(RequestBody):
+    track_id: StrictStr
+    position: Annotated[float, Field(strict=True, ge=0, le=10_000_000)] = 0
+
+
+class FavoriteBody(RequestBody):
+    favorite: StrictBool
+
+
+class RatingBody(RequestBody):
+    rating: Annotated[StrictInt, Field(ge=1, le=5)] | None
+
+
+class TagsBody(RequestBody):
+    tags: Annotated[list[StrictStr], Field(max_length=20)]
+
+
+class PlaylistBody(RequestBody):
+    name: Annotated[StrictStr, Field(max_length=80)]
+
+
+class PlaylistBooksBody(RequestBody):
+    book_ids: Annotated[list[StrictStr], Field(max_length=1000)]
+
+
+class HistoryBody(RequestBody):
+    track_id: StrictStr
+
+
+class ExclusionsBody(RequestBody):
+    paths: Annotated[list[StrictStr], Field(max_length=500)]
+
+
+class MetricsBody(RequestBody):
+    startupMs: Annotated[StrictInt, Field(ge=0, le=600_000)]
+    stalls: Annotated[StrictInt, Field(ge=0, le=10_000)]
+    bufferedAhead: Annotated[StrictInt, Field(ge=0, le=86_400)]
+    rangeMs: Annotated[StrictInt, Field(ge=0, le=86_400_000)]
+    rangeBytes: Annotated[StrictInt, Field(ge=0, le=1_000_000_000_000)]
+    ranges: Annotated[StrictInt, Field(ge=0, le=100_000)]
+
+
+class MetadataBody(RequestBody):
+    source: StrictStr
+    source_id: Annotated[StrictStr, Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
+
+
+class CachedMediaStream(Iterator[bytes]):
+    """An eagerly opened cache handle owned by one response."""
+
+    def __init__(self, source: BinaryIO, start: int, length: int) -> None:
+        self.source = source
+        self.source.seek(start)
+        self.remaining = length
+
+    def __next__(self) -> bytes:
+        if self.remaining <= 0:
+            self.close()
+            raise StopIteration
+        chunk = self.source.read(min(256 * 1024, self.remaining))
+        if not chunk:
+            self.close()
+            raise StopIteration
+        self.remaining -= len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.source.close()
+
+
+class CachedResponse(StreamingResponse):
+    def __init__(self, stream: CachedMediaStream, **kwargs: Any) -> None:
+        self.stream = stream
+        super().__init__(stream, **kwargs)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Includes a disconnect before the iterator's first read.
+            self.stream.close()
 
 
 class MediaCache:
@@ -76,20 +167,23 @@ class MediaCache:
         temp = self.path / f".{target.name}.{secrets.token_hex(8)}.part"
         try:
             with self.lock, temp.open("xb") as output:
+                digest = hashlib.md5(usedforsecurity=False)
                 for chunk in chunks:
                     output.write(chunk)
+                    digest.update(chunk)
                 os.fchmod(output.fileno(), 0o600)
                 output.flush()
                 os.fsync(output.fileno())
                 if temp.stat().st_size != size:
                     return None
+                if track.get("md5") and digest.hexdigest() != track["md5"]:
+                    logger.warning("Media checksum mismatch track=%s", track["id"])
+                    return None
                 temp.replace(target)
                 self._evict(target)
                 return target
         except (OSError, FetchError):
-            logger.info(
-                "Media cache fill failed track=%s", track.get("id"), exc_info=True
-            )
+            logger.info("Media cache fill failed track=%s", track.get("id"), exc_info=True)
             return None
         finally:
             temp.unlink(missing_ok=True)
@@ -113,16 +207,9 @@ class MediaCache:
             path.unlink(missing_ok=True)
             total -= size
 
-    def serve(self, path: Path, start: int, length: int) -> Iterator[bytes]:
-        with path.open("rb") as source:
-            source.seek(start)
-            remaining = length
-            while remaining:
-                chunk = source.read(min(256 * 1024, remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                yield chunk
+    def serve(self, path: Path, start: int, length: int) -> CachedMediaStream:
+        with self.lock:
+            return CachedMediaStream(path.open("rb"), start, length)
 
 
 class WebConfig:
@@ -141,12 +228,8 @@ class WebConfig:
         self.cache_path = Path(
             os.getenv("APP_CACHE_PATH", str(self.db_path.parent / "media-cache"))
         )
-        self.cache_max_bytes = max(
-            0, int(os.getenv("APP_CACHE_MAX_BYTES", str(30 * 1024**3)))
-        )
-        self.cache_warm_enabled = (
-            os.getenv("APP_CACHE_WARM_ENABLED", "true").lower() == "true"
-        )
+        self.cache_max_bytes = max(0, int(os.getenv("APP_CACHE_MAX_BYTES", str(30 * 1024**3))))
+        self.cache_warm_enabled = os.getenv("APP_CACHE_WARM_ENABLED", "true").lower() == "true"
 
     def check(self) -> None:
         if not self.require_https:
@@ -169,9 +252,19 @@ class WebConfig:
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.auth_lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS auth_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS book_overrides (
+                    book_id TEXT PRIMARY KEY, data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS track_identity (
+                    track_id TEXT PRIMARY KEY, book_id TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS books (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT,
                     cover TEXT, duration REAL NOT NULL DEFAULT 0, data TEXT NOT NULL
@@ -241,27 +334,59 @@ class Database:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL
                 );
             """)
-            columns = {
-                row[1] for row in db.execute("PRAGMA table_info(scan_directories)")
-            }
+            columns = {row[1] for row in db.execute("PRAGMA table_info(scan_directories)")}
             for column in ("listed", "scanned", "files_listed"):
                 if column not in columns:
                     db.execute(
                         f"ALTER TABLE scan_directories ADD COLUMN {column} "
                         "INTEGER NOT NULL DEFAULT 0"
                     )
-            inventory_columns = {
-                row[1] for row in db.execute("PRAGMA table_info(scan_inventory)")
-            }
+            inventory_columns = {row[1] for row in db.execute("PRAGMA table_info(scan_inventory)")}
             for column in ("listed", "scanned", "files_listed"):
                 if column not in inventory_columns:
                     db.execute(
-                        f"ALTER TABLE scan_inventory ADD COLUMN {column} "
-                        "INTEGER NOT NULL DEFAULT 0"
+                        f"ALTER TABLE scan_inventory ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                     )
             db.execute(
                 "INSERT OR IGNORE INTO scan_inventory(id,path) SELECT id,path FROM scan_directories"
             )
+
+            empty_book = db.execute("SELECT data FROM books WHERE id='' ").fetchone()
+            if empty_book:
+                new_id = "book-" + secrets.token_hex(16)
+                book = json.loads(empty_book["data"])
+                book["id"] = new_id
+                for track in book.get("tracks", []):
+                    track["book_id"] = new_id
+                db.execute("UPDATE books SET id=?,data=? WHERE id=''", (new_id, json.dumps(book)))
+                for row in db.execute("SELECT id,data FROM tracks WHERE book_id='' ").fetchall():
+                    track = json.loads(row["data"])
+                    track["book_id"] = new_id
+                    db.execute(
+                        "UPDATE tracks SET book_id=?,data=? WHERE id=?",
+                        (new_id, json.dumps(track), row["id"]),
+                    )
+                for table in (
+                    "progress",
+                    "favorites",
+                    "ratings",
+                    "book_tags",
+                    "playlist_books",
+                    "listening_history",
+                    "book_overrides",
+                    "track_identity",
+                ):
+                    db.execute(f"UPDATE {table} SET book_id=? WHERE book_id=''", (new_id,))
+            db.execute("INSERT OR IGNORE INTO auth_state VALUES(1,?)", (secrets.token_hex(32),))
+            db.execute("INSERT OR IGNORE INTO track_identity SELECT id,book_id FROM tracks")
+            for row in db.execute("SELECT id,data FROM books").fetchall():
+                overrides = json.loads(row["data"]).get("metadata_overrides", {})
+                if overrides:
+                    db.execute(
+                        "INSERT OR IGNORE INTO book_overrides VALUES(?,?)",
+                        (row["id"], json.dumps(overrides)),
+                    )
+        self.path.chmod(0o600)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -273,6 +398,14 @@ class Database:
         finally:
             db.close()
 
+    @contextmanager
+    def book_write(self, book_id: str) -> Iterator[sqlite3.Connection]:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM books WHERE id=?", (book_id,)).fetchone() is None:
+                raise HTTPException(404, "Book not found")
+            yield db
+
     def credentials(self) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute("SELECT data FROM credentials WHERE id=1").fetchone()
@@ -281,17 +414,57 @@ class Database:
         data = json.loads(row["data"])
         return data if data.get("refresh_token") else None
 
-    def save_credentials(self, data: str) -> None:
+    def auth_generation(self) -> str:
         with self.connect() as db:
+            return str(db.execute("SELECT generation FROM auth_state WHERE id=1").fetchone()[0])
+
+    def save_credentials(self, data: str, generation: str | None = None) -> bool:
+        with self.auth_lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT generation FROM auth_state WHERE id=1").fetchone()[0]
+            if generation is not None and generation != current:
+                return False
             db.execute("INSERT OR REPLACE INTO credentials(id,data) VALUES(1,?)", (data,))
+        return True
 
     def sync_credentials(self, path: Path) -> None:
-        data = self.credentials()
-        if data is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data), encoding="utf-8")
-        path.chmod(0o600)
+        with self.auth_lock:
+            data = self.credentials()
+            if data is None:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(dir=path.parent, prefix=".credentials-")
+            temporary = Path(name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(data, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def disconnect(self, path: Path) -> None:
+        with self.auth_lock:
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    "UPDATE auth_state SET generation=? WHERE id=1", (secrets.token_hex(32),)
+                )
+                db.execute("DELETE FROM credentials")
+            path.unlink(missing_ok=True)
+
+    def connect_account(self, data: str, path: Path) -> str:
+        with self.auth_lock:
+            self.disconnect(path)
+            generation = self.auth_generation()
+            self.save_credentials(data, generation)
+            self.sync_credentials(path)
+            return generation
+
+    def identities(self) -> dict[str, str]:
+        with self.connect() as db:
+            return dict(db.execute("SELECT track_id,book_id FROM track_identity").fetchall())
 
     def library(self) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -323,10 +496,18 @@ class Database:
 
     def update_book_metadata(self, book_id: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
-            "title", "artist", "album_artist", "album", "description", "publisher",
-            "published_date", "isbn", "cover",
+            "title",
+            "artist",
+            "album_artist",
+            "album",
+            "description",
+            "publisher",
+            "published_date",
+            "isbn",
+            "cover",
         }
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM books WHERE id=?", (book_id,)).fetchone()
             if row is None:
                 return None
@@ -334,6 +515,10 @@ class Database:
             overrides = book.setdefault("metadata_overrides", {})
             overrides.update({key: value for key, value in metadata.items() if key in allowed})
             book.update(overrides)
+            db.execute(
+                "INSERT OR REPLACE INTO book_overrides VALUES(?,?)",
+                (book_id, json.dumps(overrides)),
+            )
             db.execute(
                 "UPDATE books SET title=?,artist=?,cover=?,data=? WHERE id=?",
                 (book["title"], book.get("artist"), book.get("cover"), json.dumps(book), book_id),
@@ -349,8 +534,8 @@ class Database:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             overrides = {
-                row["id"]: json.loads(row["data"]).get("metadata_overrides", {})
-                for row in db.execute("SELECT id,data FROM books")
+                row["book_id"]: json.loads(row["data"])
+                for row in db.execute("SELECT book_id,data FROM book_overrides")
             }
             for book in books:
                 saved = overrides.get(book["id"], {})
@@ -388,6 +573,24 @@ class Database:
                     )
                     for t in tracks
                 ],
+            )
+
+            db.executemany(
+                "INSERT OR REPLACE INTO track_identity VALUES(?,?)",
+                [(track["id"], track["book_id"]) for track in tracks],
+            )
+            # Reconcile only after publishing a complete scan generation.
+            for table in ("favorites", "ratings", "book_tags", "playlist_books"):
+                db.execute(f"DELETE FROM {table} WHERE book_id NOT IN (SELECT id FROM books)")
+            db.execute(
+                "DELETE FROM progress WHERE NOT EXISTS ("
+                "SELECT 1 FROM tracks WHERE tracks.id=progress.track_id "
+                "AND tracks.book_id=progress.book_id)"
+            )
+            db.execute(
+                "DELETE FROM listening_history WHERE NOT EXISTS ("
+                "SELECT 1 FROM tracks WHERE tracks.id=listening_history.track_id "
+                "AND tracks.book_id=listening_history.book_id)"
             )
 
     def scan_status(self) -> dict[str, Any] | None:
@@ -438,16 +641,11 @@ class Database:
 
     def save_scan_files(self, folder_id: str, files: list[RemoteFile]) -> None:
         with self.connect() as db:
-            db.execute(
-                "DELETE FROM scan_file_inventory WHERE folder_id=?", (folder_id,)
-            )
-            db.execute(
-                "UPDATE scan_directories SET files_listed=0 WHERE id=?", (folder_id,)
-            )
+            db.execute("DELETE FROM scan_file_inventory WHERE folder_id=?", (folder_id,))
+            db.execute("UPDATE scan_directories SET files_listed=0 WHERE id=?", (folder_id,))
             db.execute("UPDATE scan_inventory SET files_listed=0 WHERE id=?", (folder_id,))
             db.executemany(
-                "INSERT OR IGNORE INTO scan_file_inventory(id,folder_id,data) "
-                "VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO scan_file_inventory(id,folder_id,data) VALUES(?,?,?)",
                 [
                     (
                         item.id,
@@ -468,16 +666,10 @@ class Database:
                     for item in files
                 ],
             )
-            db.execute(
-                "UPDATE scan_directories SET files_listed=1 WHERE id=?", (folder_id,)
-            )
-            db.execute(
-                "UPDATE scan_inventory SET files_listed=1 WHERE id=?", (folder_id,)
-            )
+            db.execute("UPDATE scan_directories SET files_listed=1 WHERE id=?", (folder_id,))
+            db.execute("UPDATE scan_inventory SET files_listed=1 WHERE id=?", (folder_id,))
 
-    def scan_files_for_directory(
-        self, folder_id: str, pending_ids: set[str]
-    ) -> list[RemoteFile]:
+    def scan_files_for_directory(self, folder_id: str, pending_ids: set[str]) -> list[RemoteFile]:
         with self.connect() as db:
             rows = db.execute(
                 "SELECT f.data FROM scan_file_inventory f "
@@ -511,8 +703,11 @@ class Database:
             ).fetchall()
         return [
             (
-                str(row["id"]), str(row["path"]), bool(row["listed"]),
-                bool(row["scanned"]), bool(row["files_listed"]),
+                str(row["id"]),
+                str(row["path"]),
+                bool(row["listed"]),
+                bool(row["scanned"]),
+                bool(row["files_listed"]),
             )
             for row in rows
         ]
@@ -522,9 +717,7 @@ class Database:
             db.executemany(
                 "INSERT OR IGNORE INTO scan_directories(id,path) VALUES(?,?)", directories
             )
-            db.executemany(
-                "INSERT OR IGNORE INTO scan_inventory(id,path) VALUES(?,?)", directories
-            )
+            db.executemany("INSERT OR IGNORE INTO scan_inventory(id,path) VALUES(?,?)", directories)
 
     def enqueue_scan_directory(self, folder_id: str, path: str) -> None:
         self.queue_scan_directories([(folder_id, path)])
@@ -593,7 +786,14 @@ class Database:
         self.mark_scan_directory(folder_id, scanned=True)
 
     def save_progress(self, book_id: str, track_id: str, position: float) -> None:
-        with self.connect() as db:
+        with self.book_write(book_id) as db:
+            if (
+                db.execute(
+                    "SELECT 1 FROM tracks WHERE id=? AND book_id=?", (track_id, book_id)
+                ).fetchone()
+                is None
+            ):
+                raise HTTPException(422, "track does not belong to this book")
             db.execute(
                 """INSERT INTO progress(book_id,track_id,position,updated_at)
                 VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -700,7 +900,14 @@ class Database:
                     )
 
     def record_history(self, book_id: str, track_id: str, position: float = 0) -> None:
-        with self.connect() as db:
+        with self.book_write(book_id) as db:
+            if (
+                db.execute(
+                    "SELECT 1 FROM tracks WHERE id=? AND book_id=?", (track_id, book_id)
+                ).fetchone()
+                is None
+            ):
+                raise HTTPException(422, "track does not belong to this book")
             db.execute(
                 "INSERT INTO listening_history(book_id,track_id,position) VALUES(?,?,?)",
                 (book_id, track_id, position),
@@ -717,6 +924,7 @@ class StoredDriveAuth:
     def __init__(self, db: Database, credentials_path: Path) -> None:
         self.db = db
         self._credentials_path = credentials_path
+        self.generation = db.auth_generation()
         self.creds: Any = None
         self._lock = threading.RLock()
 
@@ -732,16 +940,19 @@ class StoredDriveAuth:
     def headers(self) -> dict[str, str]:
         from google.auth.transport.requests import Request as GoogleRequest
 
-        with self._lock:
+        with self.db.auth_lock, self._lock:
+            if self.generation != self.db.auth_generation():
+                raise DriveError("Drive session ended. Sign in again.")
             creds = self.creds or self._load()
             if not creds.valid:
                 creds.refresh(GoogleRequest())
-                self.db.save_credentials(creds.to_json())
+                if not self.db.save_credentials(creds.to_json(), self.generation):
+                    raise DriveError("Drive session ended during refresh")
             self.db.sync_credentials(self._credentials_path)
             return {"Authorization": f"Bearer {creds.token}"}
 
     def refresh(self) -> None:
-        with self._lock:
+        with self.db.auth_lock, self._lock:
             self.creds = None
             self.headers()
 
@@ -796,11 +1007,15 @@ class LibraryScanner:
     def start(self, retry_failed: bool = True) -> bool:
         if not self.lock.acquire(blocking=False):
             return False
-        old_status = self.db.scan_status() or {}
-        resume = old_status.get("status") in {"running", "failed", "interrupted"}
-        self.db.save_scan_status(status="running", error="", current="")
-        threading.Thread(target=self.run, args=(retry_failed, resume), daemon=True).start()
-        return True
+        try:
+            old_status = self.db.scan_status() or {}
+            resume = old_status.get("status") in {"running", "failed", "interrupted"}
+            self.db.save_scan_status(status="running", error="", current="")
+            threading.Thread(target=self.run, args=(retry_failed, resume), daemon=True).start()
+            return True
+        except BaseException:
+            self.lock.release()
+            raise
 
     def run(self, retry_failed: bool = True, resume: bool = False) -> None:
         try:
@@ -849,16 +1064,13 @@ class LibraryScanner:
                 with self.db.connect() as connection:
                     connection.execute("DELETE FROM scan_items WHERE error != ''")
             items = [
-                item for item in self.db.pending_scan_items()
-                if not any(
-                    item.get("path", "").startswith(path) for path in excluded_prefixes
-                )
+                item
+                for item in self.db.pending_scan_items()
+                if not any(item.get("path", "").startswith(path) for path in excluded_prefixes)
             ]
-            seen = {item["id"] for item in items if not item.get("error")}
+            seen = {item["id"] for item in items if not retry_failed or not item.get("error")}
             for item in self.db.pending_scan_items():
-                if any(
-                    item.get("path", "").startswith(path) for path in excluded_prefixes
-                ):
+                if any(item.get("path", "").startswith(path) for path in excluded_prefixes):
                     with self.db.connect() as connection:
                         connection.execute("DELETE FROM scan_items WHERE id=?", (item["id"],))
             failures = 0
@@ -875,22 +1087,32 @@ class LibraryScanner:
                     self.db.mark_scan_directory(folder_id, listed=True)
                     continue
                 self.publish(
-                    status="running", total=len(seen), processed=len(seen),
-                    current=f"Listing folders: {prefix or '/'}", error="",
+                    status="running",
+                    total=len(seen),
+                    processed=len(seen),
+                    current=f"Listing folders: {prefix or '/'}",
+                    error="",
                 )
                 folders = list(source.iter_child_directories(folder_id, prefix))
-                self.db.queue_scan_directories([
-                    folder for folder in folders
-                    if folder[0] not in excluded
-                    and not any(folder[1].startswith(path) for path in excluded_prefixes)
-                ])
+                self.db.queue_scan_directories(
+                    [
+                        folder
+                        for folder in folders
+                        if folder[0] not in excluded
+                        and not any(folder[1].startswith(path) for path in excluded_prefixes)
+                    ]
+                )
                 self.db.mark_scan_directory(folder_id, listed=True)
 
             total = len(seen)
             processed = len(seen)
             failures = 0
             for (
-                folder_id, prefix, _listed, scanned, files_listed
+                folder_id,
+                prefix,
+                _listed,
+                scanned,
+                files_listed,
             ) in self.db.inventory_directories():
                 if folder_id in excluded or any(
                     prefix.startswith(path) for path in excluded_prefixes
@@ -900,8 +1122,11 @@ class LibraryScanner:
                 if scanned and not self.db.scan_files_for_directory(folder_id, seen):
                     continue
                 self.publish(
-                    status="running", total=total, processed=processed,
-                    current=f"Listing files: {prefix or '/'}", error="",
+                    status="running",
+                    total=total,
+                    processed=processed,
+                    current=f"Listing files: {prefix or '/'}",
+                    error="",
                 )
                 if not files_listed:
                     files = list(source.iter_directory_files(folder_id, prefix))
@@ -927,15 +1152,19 @@ class LibraryScanner:
                         processed += 1
                         failures += bool(error)
                         self.publish(
-                            status="running", total=total, processed=processed,
-                            current=remote.path, error="",
+                            status="running",
+                            total=total,
+                            processed=processed,
+                            current=remote.path,
+                            error="",
                         )
-                        if processed % 50 == 0:
-                            self._commit(items)
                         if error:
                             failed_ids.add(remote.id)
                 self.db.mark_scan_directory(folder_id, scanned=True)
-            self._commit(items)
+            with self.db.auth_lock:
+                if auth.generation != self.db.auth_generation():
+                    raise DriveError("Drive session ended during scan")
+                self._commit(items)
             remaining_failures = len(failed_ids) if not retry_failed else failures
             current_status = self.db.scan_status()
             if current_status and current_status.get("status") == "failed":
@@ -973,6 +1202,9 @@ class LibraryScanner:
                     modified=remote.modified,
                 )
                 error = track.error or ""
+                if track.retryable_error and attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
                 break
             except Exception as exc:
                 error = str(exc)
@@ -1004,6 +1236,17 @@ class LibraryScanner:
         }
 
     def _commit(self, items: list[dict[str, Any]]) -> None:
+        # A temporarily unreadable existing track keeps its last successful metadata.
+        previous = self.db.identities()
+        for item in items:
+            if item.get("error") and item["id"] in previous:
+                old = self.db.track(item["id"])
+                if old:
+                    item = dict(item)
+                    item["meta"] = old.get("probe_meta", {**item["meta"], **old})
+                    items = [item if entry["id"] == item["id"] else entry for entry in items]
+        identities = self.db.identities()
+        used_ids: set[str] = set()
         metadata = []
         for item in items:
             values = {
@@ -1036,13 +1279,22 @@ class LibraryScanner:
         books: list[dict[str, Any]] = []
         tracks: list[dict[str, Any]] = []
         for group in group_tracks(metadata):
+            candidates = sorted(
+                {identities[t.track.id] for t in group.tracks if t.track.id in identities}
+            )
+            book_id = next(
+                (candidate for candidate in candidates if candidate not in used_ids), None
+            )
+            if book_id is None:
+                book_id = "book-" + secrets.token_hex(16)
+            used_ids.add(book_id)
             members = []
             for grouped in group.tracks:
                 meta = grouped.track.to_dict()
                 original = remote_by_id[meta["id"]]
                 track = {
                     "id": original["id"],
-                    "book_id": group.key,
+                    "book_id": book_id,
                     "name": original["name"],
                     "path": original["path"],
                     "size": original["size"] or 0,
@@ -1055,13 +1307,14 @@ class LibraryScanner:
                     "chapters": meta.get("chapters") or [],
                     "chapter_count": len(meta.get("chapters") or []),
                     "format": meta.get("format"),
+                    "probe_meta": meta,
                 }
                 tracks.append(track)
-                members.append(track)
+                members.append({key: value for key, value in track.items() if key != "probe_meta"})
             first = group.tracks[0].track
             books.append(
                 {
-                    "id": group.key,
+                    "id": book_id,
                     "title": group.title,
                     "artist": first.artist,
                     "album_artist": first.albumartist,
@@ -1075,8 +1328,7 @@ class LibraryScanner:
                 }
             )
         self.db.save_library(books, tracks)
-        logger.info("Drive scan checkpoint committed books=%d tracks=%d", len(books), len(tracks))
-
+        logger.info("Drive scan published books=%d tracks=%d", len(books), len(tracks))
 
 
 def create_app(config: WebConfig | None = None, db: Database | None = None) -> FastAPI:
@@ -1099,10 +1351,9 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 auth=auth,
                 name=track["name"],
             )
-            reader = SeekableBlockReader(
-                fetcher, block_size=256 * 1024, name=track["name"]
-            )
+            reader = SeekableBlockReader(fetcher, block_size=256 * 1024, name=track["name"])
             try:
+
                 def chunks() -> Iterator[bytes]:
                     while chunk := reader.read(256 * 1024):
                         yield chunk
@@ -1111,9 +1362,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             finally:
                 reader.close()
         except Exception:
-            logger.info(
-                "Media warm failed track=%s", track.get("id"), exc_info=True
-            )
+            logger.info("Media warm failed track=%s", track.get("id"), exc_info=True)
         finally:
             client.close()
             cache_warm_slots.release()
@@ -1135,6 +1384,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         cache._evict(Path())
     except OSError:
         logger.info("Media cache startup eviction failed", exc_info=True)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config.check()
@@ -1180,7 +1430,11 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
 
     def user(request: Request) -> str:
         email = str(request.session.get("email", "")).lower()
-        if not email or email != config.allowed_email:
+        if (
+            not email
+            or email != config.allowed_email
+            or request.session.get("generation") != db.auth_generation()
+        ):
             logger.warning(
                 "auth_rejected path=%s cookie_in=%s session_email=%s allowed_email_configured=%s",
                 request.url.path,
@@ -1270,18 +1524,17 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             raise HTTPException(403, "Approve read-only Google Drive access to use the library")
         if not creds.refresh_token:
             raise HTTPException(403, "Reconnect Google with offline access enabled")
-        db.save_credentials(creds.to_json())
-        db.sync_credentials(config.credentials_path)
+        generation = db.connect_account(creds.to_json(), config.credentials_path)
         request.session.clear()
         request.session["email"] = email
+        request.session["generation"] = generation
         return RedirectResponse("/", headers={"Cache-Control": "no-store"})
 
     @app.post("/auth/logout")
     def logout(request: Request) -> Response:
         user(request)
         request.session.clear()
-        db.save_credentials("{}")
-        config.credentials_path.unlink(missing_ok=True)
+        db.disconnect(config.credentials_path)
         return Response(status_code=204)
 
     @app.get("/api/library")
@@ -1323,7 +1576,8 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             # terminate a subscription opened for a newer scan.
             with scanner.event_lock:
                 last_id = scanner.event_id
-            yield f"data: {json.dumps(scanner.db.scan_status() or {'status': 'idle'})}\n\n"
+            initial = await run_in_threadpool(scanner.db.scan_status) or {"status": "idle"}
+            yield f"data: {json.dumps(initial)}\n\n"
             while not await request.is_disconnected():
                 with scanner.event_lock:
                     pending = [event for event in scanner.events if event["id"] > last_id]
@@ -1334,7 +1588,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                     if pending[-1].get("status") in {"completed", "failed"}:
                         return
                 else:
-                    status = scanner.db.scan_status() or {"status": "idle"}
+                    status = await run_in_threadpool(scanner.db.scan_status) or {"status": "idle"}
                     yield f"data: {json.dumps(status)}\n\n"
                     if status.get("status") != "running":
                         return
@@ -1357,8 +1611,8 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
 
     @app.post("/api/books/{book_id}/metadata/search")
     async def search_book_metadata(book_id: str, request: Request) -> dict[str, Any]:
-        user(request)
-        book = db.book(book_id)
+        await run_in_threadpool(user, request)
+        book = await run_in_threadpool(db.book, book_id)
         if book is None:
             raise HTTPException(404, "Book not found")
         params = {
@@ -1420,18 +1674,20 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         for item in payload.get("docs", []):
             cover_id = item.get("cover_i")
             if item.get("title") and re.fullmatch(r"/works/OL[0-9]+W", str(item.get("key", ""))):
-                candidates.append({
-                    "source": "Open Library",
-                    "source_id": str(item["key"]).removeprefix("/works/"),
-                    "title": item.get("title"),
-                    "authors": item.get("author_name", []),
-                    "published_date": str(item.get("first_publish_year", "")),
-                    "cover": (
-                        f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
-                        if cover_id
-                        else ""
-                    ),
-                })
+                candidates.append(
+                    {
+                        "source": "Open Library",
+                        "source_id": str(item["key"]).removeprefix("/works/"),
+                        "title": item.get("title"),
+                        "authors": item.get("author_name", []),
+                        "published_date": str(item.get("first_publish_year", "")),
+                        "cover": (
+                            f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
+                            if cover_id
+                            else ""
+                        ),
+                    }
+                )
         if not candidates and source_errors:
             raise HTTPException(
                 502,
@@ -1440,11 +1696,13 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return {"candidates": candidates, "source_errors": source_errors}
 
     @app.post("/api/books/{book_id}/metadata/apply")
-    async def apply_book_metadata(book_id: str, request: Request) -> dict[str, Any]:
-        user(request)
-        if db.book(book_id) is None:
+    async def apply_book_metadata(
+        book_id: str, request: Request, input_data: MetadataBody
+    ) -> dict[str, Any]:
+        await run_in_threadpool(user, request)
+        if await run_in_threadpool(db.book, book_id) is None:
             raise HTTPException(404, "Book not found")
-        body = await request.json()
+        body = input_data.model_dump()
         if (
             not isinstance(body, dict)
             or body.get("source") not in {"Google Books", "Open Library"}
@@ -1494,20 +1752,22 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             "isbn": isbn,
             "cover": cover.replace("http://", "https://") or None,
         }
-        updated = db.update_book_metadata(
-            book_id, {key: value for key, value in metadata.items() if value}
+        updated = await run_in_threadpool(
+            db.update_book_metadata,
+            book_id,
+            {key: value for key, value in metadata.items() if value},
         )
         if updated is None:
             raise HTTPException(404, "Book not found")
         return updated
 
     @app.put("/api/progress/{book_id}")
-    async def progress(book_id: str, request: Request) -> dict[str, Any]:
+    def progress(book_id: str, request: Request, payload: ProgressBody) -> dict[str, Any]:
         user(request)
         book = db.book(book_id)
         if book is None:
             raise HTTPException(404, "Book not found")
-        if not isinstance(body := await request.json(), dict):
+        if not isinstance(body := payload.model_dump(), dict):
             raise HTTPException(422, "request body must be a JSON object")
         track_id = str(body.get("track_id", ""))
         try:
@@ -1530,14 +1790,14 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return data
 
     @app.put("/api/books/{book_id}/favorite")
-    async def favorite(book_id: str, request: Request) -> dict[str, bool]:
+    def favorite(book_id: str, request: Request, payload: FavoriteBody) -> dict[str, bool]:
         user(request)
         if db.book(book_id) is None:
             raise HTTPException(404, "Book not found")
-        body = await request.json()
+        body = payload.model_dump()
         if not isinstance(body, dict) or not isinstance(body.get("favorite"), bool):
             raise HTTPException(422, "favorite must be a boolean")
-        with db.connect() as connection:
+        with db.book_write(book_id) as connection:
             if body["favorite"]:
                 connection.execute("INSERT OR IGNORE INTO favorites(book_id) VALUES(?)", (book_id,))
             else:
@@ -1545,17 +1805,17 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return {"favorite": body["favorite"]}
 
     @app.put("/api/books/{book_id}/rating")
-    async def rating(book_id: str, request: Request) -> dict[str, int | None]:
+    def rating(book_id: str, request: Request, payload: RatingBody) -> dict[str, int | None]:
         user(request)
         if db.book(book_id) is None:
             raise HTTPException(404, "Book not found")
-        body = await request.json()
+        body = payload.model_dump()
         value = body.get("rating") if isinstance(body, dict) else None
         if value is not None and (
             not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 5
         ):
             raise HTTPException(422, "rating must be an integer from 1 to 5, or null")
-        with db.connect() as connection:
+        with db.book_write(book_id) as connection:
             if value is None:
                 connection.execute("DELETE FROM ratings WHERE book_id=?", (book_id,))
             else:
@@ -1567,11 +1827,11 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return {"rating": value}
 
     @app.put("/api/books/{book_id}/tags")
-    async def tags(book_id: str, request: Request) -> dict[str, list[str]]:
+    def tags(book_id: str, request: Request, payload: TagsBody) -> dict[str, list[str]]:
         user(request)
         if db.book(book_id) is None:
             raise HTTPException(404, "Book not found")
-        body = await request.json()
+        body = payload.model_dump()
         values = body.get("tags") if isinstance(body, dict) else None
         if (
             not isinstance(values, list)
@@ -1585,7 +1845,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 422, "tags must be a list of up to 20 non-empty strings of at most 40 characters"
             )
         clean = list(dict.fromkeys(tag.strip() for tag in values))
-        with db.connect() as connection:
+        with db.book_write(book_id) as connection:
             connection.execute("DELETE FROM book_tags WHERE book_id=?", (book_id,))
             connection.executemany(
                 "INSERT INTO book_tags(book_id,tag) VALUES(?,?)", [(book_id, tag) for tag in clean]
@@ -1593,9 +1853,9 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return {"tags": clean}
 
     @app.post("/api/playlists", status_code=201)
-    async def create_playlist(request: Request) -> dict[str, Any]:
+    def create_playlist(request: Request, payload: PlaylistBody) -> dict[str, Any]:
         user(request)
-        body = await request.json()
+        body = payload.model_dump()
         name = (
             body.get("name", "").strip()
             if isinstance(body, dict) and isinstance(body.get("name"), str)
@@ -1609,9 +1869,11 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return {"id": playlist_id, "name": name, "book_ids": []}
 
     @app.put("/api/playlists/{playlist_id}/books")
-    async def playlist_books(playlist_id: str, request: Request) -> dict[str, list[str]]:
+    def playlist_books(
+        playlist_id: str, request: Request, payload: PlaylistBooksBody
+    ) -> dict[str, list[str]]:
         user(request)
-        body = await request.json()
+        body = payload.model_dump()
         ids = body.get("book_ids") if isinstance(body, dict) else None
         if (
             not isinstance(ids, list)
@@ -1624,6 +1886,10 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         if any(item not in known for item in ids):
             raise HTTPException(422, "all playlist books must exist in the library")
         with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = {row[0] for row in connection.execute("SELECT id FROM books")}
+            if any(item not in current for item in ids):
+                raise HTTPException(422, "all playlist books must exist in the library")
             if (
                 connection.execute("SELECT 1 FROM playlists WHERE id=?", (playlist_id,)).fetchone()
                 is None
@@ -1647,9 +1913,9 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return Response(status_code=204)
 
     @app.post("/api/history/{book_id}", status_code=204)
-    async def record_history(book_id: str, request: Request) -> Response:
+    def record_history(book_id: str, request: Request, payload: HistoryBody) -> Response:
         user(request)
-        body = await request.json()
+        body = payload.model_dump()
         track_id = body.get("track_id") if isinstance(body, dict) else None
         if not isinstance(track_id, str):
             raise HTTPException(422, "track_id is required")
@@ -1665,9 +1931,9 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return db.scanned_directories()
 
     @app.put("/api/settings/excluded-directories")
-    async def update_excluded_directories(request: Request) -> dict[str, Any]:
+    def update_excluded_directories(request: Request, payload: ExclusionsBody) -> dict[str, Any]:
         user(request)
-        body = await request.json()
+        body = payload.model_dump()
         paths = body.get("paths") if isinstance(body, dict) else None
         if (
             not isinstance(paths, list)
@@ -1790,9 +2056,14 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 status_code=416,
                 headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
             )
-        cached = cache.file(track)
+        cached_stream = None
+        with cache.lock:
+            cached = cache.file(track)
+            if cached is not None:
+                with suppress(OSError):
+                    cached_stream = cache.serve(cached, start, end - start + 1)
         mime = _mime_type(track)
-        if cached is not None:
+        if cached_stream is not None:
             length = end - start + 1
             headers = {
                 "Accept-Ranges": "bytes",
@@ -1803,8 +2074,8 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             if start != 0 or end != size - 1:
                 headers["Content-Range"] = f"bytes {start}-{end}/{size}"
                 status = 206
-            return StreamingResponse(
-                cache.serve(cached, start, length),
+            return CachedResponse(
+                cached_stream,
                 status_code=status,
                 media_type=mime,
                 headers=headers,
@@ -1887,11 +2158,11 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         return StreamingResponse(chunks(), status_code=status, media_type=mime, headers=headers)
 
     @app.post("/api/tracks/{track_id}/playback-metrics", status_code=204)
-    async def playback_metrics(track_id: str, request: Request) -> Response:
+    def playback_metrics(track_id: str, request: Request, payload: MetricsBody) -> Response:
         user(request)
         if db.track(track_id) is None:
             raise HTTPException(404, "Track not found")
-        body = await request.json()
+        body = payload.model_dump()
         fields = {
             "startupMs": (0, 600_000),
             "stalls": (0, 10_000),
