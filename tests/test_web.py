@@ -191,8 +191,8 @@ def test_library_features_favorites_ratings_tags_playlists_history_storage(tmp_p
     assert playlist.status_code == 201
     playlist_id = playlist.json()["id"]
     assert client.put(
-        f"/api/playlists/{playlist_id}/books", json={"book_ids": ["book-key"]}
-    ).json() == {"book_ids": ["book-key"]}
+        f"/api/playlists/{playlist_id}/books", json={"book_ids": ["book-key"], "base_revision": 0}
+    ).json() == {"book_ids": ["book-key"], "revision": 1}
     assert client.post("/api/history/book-key", json={"track_id": "drive-track"}).status_code == 204
     assert client.get("/api/features").json()["playlists"][0]["book_ids"] == ["book-key"]
     book = client.get("/api/library").json()[0]
@@ -264,9 +264,9 @@ def test_progress_requires_valid_book_track_and_position(tmp_path: Path) -> None
     client = TestClient(create_app(cfg, db))
     sign_in(client)
     path = "/api/progress/book-key"
-    assert client.put(path, json={"track_id": "wrong", "position": 10}).status_code == 422
+    assert client.put(path, json={"track_id": "wrong", "position": 10, "base_revision": 0, "event_id": "wrong"}).status_code == 422
     assert client.put(path, json={"track_id": "drive-track", "position": -1}).status_code == 422
-    saved = client.put(path, json={"track_id": "drive-track", "position": 12.5})
+    saved = client.put(path, json={"track_id": "drive-track", "position": 12.5, "base_revision": 0, "event_id": "first"})
     assert saved.status_code == 200
     assert db.library()[0]["progress"]["position"] == 12.5
 
@@ -550,7 +550,7 @@ def test_library_scan_routes_return_progress_and_require_login(
     assert events.status_code == 200
     assert "text/event-stream" in events.headers["content-type"]
     assert '"status": "idle"' in events.text
-    assert client.post("/api/library/refresh").json() == {"status": "running"}
+    assert client.post("/api/library/refresh").json()["status"] == "running"
     assert client.get("/api/library/scan").json()["status"] == "running"
 
 

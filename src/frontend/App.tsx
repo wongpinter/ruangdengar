@@ -4,15 +4,19 @@ import { ArrowLeft, BookOpen, CheckCircle2, Clock3, Headphones, Library, LoaderC
 import { Avatar, Button, Card, Cover, Input, PlayIcon, Progress, Skeleton } from './components/ui'
 import { PlayerBar } from './components/PlayerBar'
 import type { Book, Chapter, MetadataCandidate, Progress as ListeningProgress, Track } from './types'
-import { resumeTrack, listeningStatus, newerCheckpoint, persistCheckpoint, type Checkpoint } from './listening'
+import { resumeTrack, listeningStatus, newerCheckpoint, persistCheckpoint, registerProgress, progressRevision, editionQueue, uniqueBooks, type Checkpoint } from './listening'
 
 type ScanStatus = { status: string; total: number; processed: number; current: string; error: string }
-type Features = { favorites: string[]; ratings: Record<string, number>; tags: Record<string, string[]>; playlists: { id: string; name: string; book_ids: string[] }[]; history: { book_id: string; track_id: string; position: number; played_at: string }[] }
-type StorageInfo = { tracks: number; bytes: number; formats: { mime_type: string; count: number }[] }
+type Features = { favorites: string[]; ratings: Record<string, number>; tags: Record<string, string[]>; playlists: { id: string; name: string; book_ids: string[]; revision: number }[]; history: { book_id: string; track_id: string; position: number; played_at: string }[] }
+type StorageInfo = { tracks: number; bytes: number; source_bytes: number; cached_bytes: number; cache_budget_bytes: number; formats: { mime_type: string; count: number }[] }
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', ...options })
-  if (!response.ok) throw new Error(response.status === 401 ? 'Sign in to open your library.' : await response.text())
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string | { code?: string } } | null
+    throw new Error(response.status === 401 ? 'Sign in to open your library.' : typeof body?.detail === 'string' ? body.detail : `Request failed (${response.status}).`)
+  }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
@@ -26,6 +30,7 @@ function App() {
   const [favoritesOnly, setFavoritesOnly] = useState(false)
   const [playlistView, setPlaylistView] = useState<string | null>(null)
   const [error, setError] = useState('')
+  const [playbackError, setPlaybackError] = useState('')
   const [loading, setLoading] = useState(true)
   const [scan, setScan] = useState<ScanStatus | null>(null)
   const [features, setFeatures] = useState<Features>({ favorites: [], ratings: {}, tags: {}, playlists: [], history: [] })
@@ -37,15 +42,17 @@ function App() {
   const [autoPlay, setAutoPlay] = useState(false)
   const [resumeBook, setResumeBook] = useState<Book | null>(null)
   const navigate = useNavigate()
-  const progressState = useRef({ lastSentAt: 0, latest: null as Checkpoint | null })
+  const progressState = useRef({ lastSentAt: 0, conflicted: false, latest: null as Checkpoint | null })
   const prefetchedTracks = useRef(new Set<string>())
   const currentListen = useRef<{ bookId: string; trackId: string } | null>(null)
 
   const load = useCallback(async () => {
     try {
-      const [result, recent] = await Promise.all([api<Book[]>('/api/library'), api<Features>('/api/features')])
-      setBooks(result)
-      void api<ScanStatus>('/api/library/scan').then(setScan).catch(() => {})
+      const data = await api<{ books: Book[]; features: Features; storage: StorageInfo; scan: ScanStatus }>('/api/bootstrap')
+      const result = data.books
+      const recent = data.features
+      result.forEach(book => registerProgress(book.id, book.progress))
+      setBooks(result); setFeatures(recent); setStorage(data.storage); setScan(data.scan)
       const lastPlayed = recent.history[0]?.book_id
       let saved: Checkpoint | null = null
       try { saved = JSON.parse(localStorage.getItem('ruangdengar.last-listening') || 'null') } catch { /* storage can be disabled */ }
@@ -57,7 +64,7 @@ function App() {
       const candidates = book ? [newerCheckpoint(book, pending), newerCheckpoint(book, saved)].filter((item): item is Checkpoint => !!item) : []
       const local = candidates.sort((a, b) => b.savedAt - a.savedAt)[0]
       const recovery = local && book
-        ? { ...book, progress: { track_id: local.trackId, position: local.position } }
+        ? { ...book, progress: { ...book.progress, track_id: local.trackId, position: local.position, revision: local.baseRevision } }
         : book?.progress?.track_id ? book : null
       setResumeBook(recovery || null)
       result.filter(book => (book.progress?.position ?? 0) > 0).slice(0, 3).forEach(book => { const track = book.tracks.find(item => item.id === book.progress?.track_id); if (track) void fetch(`/api/tracks/${encodeURIComponent(track.id)}/warm`, { method: 'POST', credentials: 'same-origin' }).catch(() => {}) })
@@ -69,7 +76,7 @@ function App() {
     try { const [data, info] = await Promise.all([api<Features>('/api/features'), api<StorageInfo>('/api/storage')]); setFeatures(data); setStorage(info); setFeatureError('') }
     catch (e) { setFeatureError(e instanceof Error ? e.message : 'Could not load library tools.') }
   }, [])
-  useEffect(() => { void load(); void loadFeatures() }, [load, loadFeatures])
+  useEffect(() => { void load() }, [load])
   const refreshLibrary = useCallback(async () => {
     try {
       const response = await fetch('/api/library/refresh', { method: 'POST', credentials: 'same-origin' })
@@ -79,22 +86,15 @@ function App() {
   }, [])
   const scanRunning = scan?.status === 'running'
   useEffect(() => {
-    let events: EventSource | null = null
-    let disposed = false
-    void api<ScanStatus>('/api/library/scan').then(status => {
-      if (disposed) return
-      setScan(status)
-      if (scanRunning || status.status === 'running') {
-        events = new EventSource('/api/library/events')
-        events.onmessage = event => {
-          const next = JSON.parse(event.data) as ScanStatus
-          setScan(next)
-          if (next.status === 'completed' || next.status === 'failed') { events?.close(); void load() }
-          else if (next.processed > 0 && next.processed % 50 === 0) void load()
-        }
-      }
-    }).catch(() => {})
-    return () => { disposed = true; events?.close() }
+    if (!scanRunning) return
+    const events = new EventSource('/api/library/events')
+    events.onmessage = event => {
+      const next = JSON.parse(event.data) as ScanStatus
+      setScan(next)
+      if (next.status === 'completed') { events.close(); void load() }
+      else if (next.status === 'failed') events.close()
+    }
+    return () => events.close()
   }, [load, scanRunning])
   const filtered = useMemo(() => books
     .filter(book => !favoritesOnly || features.favorites.includes(book.id))
@@ -110,27 +110,25 @@ function App() {
           : sortBy === 'rating' ? (features.ratings[a.id] ?? 0) - (features.ratings[b.id] ?? 0)
             : sortBy === 'added' ? (a.added_at ?? '').localeCompare(b.added_at ?? '')
               : a.title.localeCompare(b.title)
-      return sortDirection === 'asc' ? order : -order
+      return sortDirection === 'asc' ? order || a.id.localeCompare(b.id) : -(order || a.id.localeCompare(b.id))
     }),
   [books, filter, statusFilter, sortBy, sortDirection, features, favoritesOnly, playlistView])
   const play = (book: Book, track: Track, start = 0) => {
+    registerProgress(book.id, book.progress)
+    progressState.current.conflicted = false
+    setPlaybackError('')
     currentListen.current = { bookId: book.id, trackId: track.id }
-    try { localStorage.setItem('ruangdengar.last-listening', JSON.stringify({ bookId: book.id, trackId: track.id, position: start, savedAt: Date.now() })) } catch { /* storage can be disabled */ }
+    try { localStorage.setItem('ruangdengar.last-listening', JSON.stringify({ bookId: book.id, trackId: track.id, position: start, savedAt: Date.now(), baseRevision: progressRevision(book.id), eventId: crypto.randomUUID() })) } catch { /* storage can be disabled */ }
     setResumeBook(null)
     setAutoPlay(true)
-    void fetch(`/api/history/${encodeURIComponent(book.id)}`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track_id: track.id }) })
+    void api(`/api/history/${encodeURIComponent(book.id)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track_id: track.id, position: start }) }).then(loadFeatures).catch(() => setFeatureError('Could not update listening history.'))
     void fetch(`/api/tracks/${encodeURIComponent(track.id)}/warm`, { method: 'POST', credentials: 'same-origin' }).catch(() => {})
     setActiveBook(book); setActiveTrack(track); setStartAt(start)
-    void loadFeatures()
   }
   const trackQueue = useMemo(() => {
     if (!activeBook || !activeTrack) return []
-    const album = activeBook.album?.trim()
-    const queue = album
-      ? books.flatMap(book => book.album?.trim() === album && book.artist === activeBook.artist ? book.tracks.map(track => ({ book, track })) : [])
-      : activeBook.tracks.map(track => ({ book: activeBook, track }))
-    return queue.some(item => item.track.id === activeTrack.id) ? queue : activeBook.tracks.map(track => ({ book: activeBook, track }))
-  }, [activeBook, activeTrack, books])
+    return editionQueue(activeBook)
+  }, [activeBook, activeTrack])
   const queueIndex = trackQueue.findIndex(item => item.track.id === activeTrack?.id)
   const moveTrack = (delta: number) => {
     const index = queueIndex
@@ -139,7 +137,7 @@ function App() {
     if (next) play(next.book, next.track)
   }
   const updateBookFeature = async (bookId: string, kind: 'favorite' | 'rating' | 'tags', value: boolean | number | string[]) => {
-    const result = await api<Record<string, unknown>>(`/api/books/${encodeURIComponent(bookId)}/${kind}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [kind]: value }) })
+    const result = await api<Record<string, unknown>>(`/api/books/${encodeURIComponent(bookId)}/${kind}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [kind]: kind === 'rating' && value === 0 ? null : value }) })
     if (kind === 'favorite') setFeatures(previous => ({ ...previous, favorites: value ? [...new Set([...previous.favorites, bookId])] : previous.favorites.filter(id => id !== bookId) }))
     if (kind === 'rating') setFeatures(previous => { const ratings = { ...previous.ratings }; if (result.rating) ratings[bookId] = result.rating as number; else delete ratings[bookId]; return { ...previous, ratings } })
     if (kind === 'tags') setFeatures(previous => ({ ...previous, tags: { ...previous.tags, [bookId]: result.tags as string[] } }))
@@ -153,7 +151,7 @@ function App() {
   const addToPlaylist = async (playlistId: string, bookId: string) => {
     const playlist = features.playlists.find(item => item.id === playlistId)
     if (!playlist || playlist.book_ids.includes(bookId)) return
-    try { const result = await api<{ book_ids: string[] }>(`/api/playlists/${playlistId}/books`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ book_ids: [...playlist.book_ids, bookId] }) }); setFeatures(previous => ({ ...previous, playlists: previous.playlists.map(item => item.id === playlistId ? { ...item, book_ids: result.book_ids } : item) })) }
+    try { const result = await api<Features['playlists'][number]>(`/api/playlists/${encodeURIComponent(playlistId)}/books/${encodeURIComponent(bookId)}`, { method: 'PUT' }); setFeatures(previous => ({ ...previous, playlists: previous.playlists.map(item => item.id === playlistId ? result : item) })) }
     catch (e) { setFeatureError(e instanceof Error ? e.message : 'Could not update playlist.') }
   }
   const saveProgress = useCallback((time: number, force = false) => {
@@ -165,8 +163,8 @@ function App() {
         void fetch(`/api/tracks/${encodeURIComponent(next.id)}/warm`, { method: 'POST', credentials: 'same-origin' }).catch(() => {})
       }
     }
-    if (!activeBook || !activeTrack || !Number.isFinite(time) || time < 0) return
-    const checkpoint = { bookId: activeBook.id, trackId: activeTrack.id, position: Math.floor(time), savedAt: Date.now() }
+    if (progressState.current.conflicted || !activeBook || !activeTrack || !Number.isFinite(time) || time < 0) return
+    const checkpoint: Checkpoint = { bookId: activeBook.id, trackId: activeTrack.id, position: Math.floor(time), savedAt: Date.now(), baseRevision: progressRevision(activeBook.id), eventId: crypto.randomUUID(), completed: activeBook.tracks.at(-1)?.id === activeTrack.id && activeTrack.duration > 0 && time >= activeTrack.duration - 0.5 }
     if (currentListen.current?.bookId === checkpoint.bookId && currentListen.current.trackId === checkpoint.trackId) {
       try { localStorage.setItem('ruangdengar.last-listening', JSON.stringify(checkpoint)) } catch { /* storage can be disabled */ }
     }
@@ -174,12 +172,37 @@ function App() {
     try { localStorage.setItem('ruangdengar.pending-progress', JSON.stringify(checkpoint)) } catch { /* storage can be disabled */ }
     if (!force && Date.now() - progressState.current.lastSentAt < 15_000) return
     progressState.current.lastSentAt = Date.now()
-    setBooks(previous => previous.map(book => book.id === checkpoint.bookId ? { ...book, progress: { track_id: checkpoint.trackId, position: checkpoint.position, updated_at: new Date(checkpoint.savedAt).toISOString() } } : book))
-    void persistCheckpoint(checkpoint).then(response => {
+    setBooks(previous => previous.map(book => book.id === checkpoint.bookId ? { ...book, progress: { ...book.progress, track_id: checkpoint.trackId, position: checkpoint.position, updated_at: new Date(checkpoint.savedAt).toISOString() } } : book))
+    void persistCheckpoint(checkpoint).then(async response => {
+      if (response.status === 409) {
+        setPlaybackError('Your listening position changed in another session. Resume from the saved position to continue.')
+        if (currentListen.current?.bookId === checkpoint.bookId) {
+          progressState.current.conflicted = true
+          progressState.current.latest = null
+          document.querySelector<HTMLAudioElement>('.player-bar audio')?.pause()
+          setActiveBook(null); setActiveTrack(null)
+          try {
+            const stored = JSON.parse(localStorage.getItem('ruangdengar.pending-progress') || 'null') as Checkpoint | null
+            if (stored?.bookId === checkpoint.bookId) localStorage.removeItem('ruangdengar.pending-progress')
+          } catch { /* storage can be disabled */ }
+        }
+        void load()
+        return
+      }
       if (!response.ok) throw new Error(`Progress save failed: ${response.status}`)
+      const accepted = await response.json() as ListeningProgress
+      const latest = progressState.current.latest
+      if (latest && latest !== checkpoint && latest.bookId === checkpoint.bookId && (latest.baseRevision ?? 0) < (accepted.revision ?? 0)) {
+        latest.baseRevision = accepted.revision
+        try {
+          const stored = JSON.parse(localStorage.getItem('ruangdengar.pending-progress') || 'null') as Checkpoint | null
+          if (stored?.eventId === latest.eventId) localStorage.setItem('ruangdengar.pending-progress', JSON.stringify(latest))
+        } catch { /* storage can be disabled */ }
+      }
+      setBooks(previous => previous.map(book => book.id === checkpoint.bookId ? { ...book, progress: accepted } : book))
       if (progressState.current.latest === checkpoint) { try { localStorage.removeItem('ruangdengar.pending-progress') } catch { /* storage can be disabled */ } }
-    }).catch(() => {})
-  }, [activeBook, activeTrack])
+    }).catch(() => setPlaybackError('Your position is saved on this device. It will retry when you reconnect.'))
+  }, [activeBook, activeTrack, load])
   useEffect(() => {
     const flush = () => {
       const checkpoint = progressState.current.latest
@@ -217,9 +240,9 @@ function App() {
       <nav className="desktop-nav" aria-label="Main navigation"><Link to="/">Home</Link><Link to="/search">Search</Link><Link to="/library">Library</Link></nav>
       <div className="header-actions"><Button className="scan-action" disabled={scan?.status === 'running'} onClick={() => void refreshLibrary()}>{scan?.status === 'running' ? 'Scanning…' : 'Scan Drive'}</Button><Link className="settings-link" to="/settings" aria-label="Settings"><Settings2 size={19} /></Link></div>
     </header>
-    <main className="main-content"><Routes>
+    <main className="main-content">{playbackError && <div className="empty-state" role="alert">{playbackError}</div>}<Routes>
       <Route path="/" element={<HomePage books={filtered} features={features} scan={scan} error={error} onOpen={openBook} onPlay={playBook} onLibrary={() => navigate('/library')} onRefresh={() => void refreshLibrary()} />} />
-      <Route path="/search" element={<SearchPage books={filtered} query={filter} setQuery={setFilter} onOpen={openBook} />} />
+      <Route path="/search" element={<SearchPage query={filter} setQuery={setFilter} onOpen={openBook} />} />
       <Route path="/library" element={<LibraryPage sortDirection={sortDirection} setSortDirection={setSortDirection} groupMode={groupMode} setGroupMode={setGroupMode} onOpenGroup={groupLink} books={filtered} allBooks={books} features={features} storage={storage} featureError={featureError} onFeature={updateBookFeature} favoritesOnly={favoritesOnly} setFavoritesOnly={setFavoritesOnly} onCreatePlaylist={makePlaylist} onAddToPlaylist={addToPlaylist} onPlaylistView={setPlaylistView} playlistView={playlistView} reloadFeatures={loadFeatures} query={filter} setQuery={setFilter} statusFilter={statusFilter} setStatusFilter={setStatusFilter} sortBy={sortBy} setSortBy={setSortBy} error={error} loading={loading} scan={scan} onRefresh={() => void refreshLibrary()} onOpen={openBook} onPlay={playBook} />} />
       <Route path="/group/:mode" element={<GroupPage books={filtered} onOpen={openBook} onOpenGroup={groupLink} />} />
       <Route path="/book/:bookId" element={<BookPage onPlay={play} />} />
@@ -243,31 +266,44 @@ function BottomNavigation() {
 
 function HomePage({ books, features, scan, error, onOpen, onPlay, onLibrary, onRefresh }: { books: Book[]; features: Features; scan: ScanStatus | null; error: string; onOpen: (book: Book) => void; onPlay: (book: Book) => void; onLibrary: () => void; onRefresh: () => void }) {
   const booksById = new Map(books.map(book => [book.id, book]))
-  const seenAlbums = new Set<string>()
-  const listening = [...features.history.map(item => booksById.get(item.book_id)).filter((book): book is Book => !!book), ...books.filter(book => (book.progress?.position ?? 0) > 0)]
-    .filter(book => {
-      const albumKey = book.album?.trim()
-        ? `${book.artist?.trim().toLocaleLowerCase() ?? ''}:${book.album.trim().toLocaleLowerCase()}`
-        : book.id
-      if (seenAlbums.has(albumKey)) return false
-      seenAlbums.add(albumKey)
-      return true
-    })
-    .slice(0, 5)
+  const listening = uniqueBooks([...features.history.map(item => booksById.get(item.book_id)).filter((book): book is Book => !!book), ...books.filter(book => (book.progress?.book_position ?? book.progress?.position ?? 0) > 0)]).slice(0, 5)
   return <section className="home-page">
     <div className="home-greeting"><div><span className="eyebrow">YOUR PERSONAL LIBRARY</span><h1>Good stories,<br />good company.</h1><p>Your next chapter is waiting.</p></div><Avatar className="home-avatar">A</Avatar></div>
     {scan && <ScanProgress scan={scan} onRefresh={onRefresh} />}
     {error && <div className="empty-state">{error} <a href="/auth/google">Sign in</a></div>}
     <SectionHeader title="Continue listening" action="View library" onAction={onLibrary} />
-    {listening.length ? <div className="home-book-shelf">{listening.map(book => <button className="home-book-tile" key={book.id} onClick={() => onPlay(book)}><Cover className="home-book-cover" src={book.cover || '/icon.svg'} alt={`${book.title} cover`} /><span className="home-book-copy"><strong>{book.title}</strong><small>{book.artist || 'Audiobook'}</small><Progress value={book.tracks.find(track => track.id === book.progress?.track_id)?.duration ? (book.progress!.position / book.tracks.find(track => track.id === book.progress?.track_id)!.duration) * 100 : 0} label={`${book.title} listening progress`} /></span></button>)}</div> : <div className="home-empty"><Headphones size={24} /><p>Your listening shelf will appear here.</p><Button onClick={onLibrary}>Browse library</Button></div>}
+    {listening.length ? <div className="home-book-shelf">{listening.map(book => <button className="home-book-tile" key={book.id} onClick={() => onPlay(book)}><Cover className="home-book-cover" src={book.cover || '/icon.svg'} alt={`${book.title} cover`} /><span className="home-book-copy"><strong>{book.title}</strong><small>{book.artist || 'Audiobook'}</small><Progress value={(book.progress?.fraction ?? 0) * 100} label={`${book.title} listening progress`} /></span></button>)}</div> : <div className="home-empty"><Headphones size={24} /><p>Your listening shelf will appear here.</p><Button onClick={onLibrary}>Browse library</Button></div>}
     <SectionHeader title="Your library" subtitle={`${books.length} audiobooks`} action="Browse all" onAction={onLibrary} />
     {books.length ? <div className="home-book-grid">{books.slice(0, 8).map(book => <button className="home-library-tile" key={book.id} onClick={() => onOpen(book)}><Cover className="home-library-cover" src={book.cover || '/icon.svg'} alt={`${book.title} cover`} /><strong>{book.title}</strong><small>{book.artist || 'Audiobook'}</small></button>)}</div> : <div className="home-empty"><p>Your Drive library is ready when you are.</p><Button onClick={onLibrary}>Open library</Button></div>}
     {features.playlists.length > 0 && <><SectionHeader title="Playlists" action="Manage" onAction={onLibrary} /><div className="home-playlists">{features.playlists.slice(0, 4).map((playlist, index) => <button key={playlist.id} onClick={onLibrary}><span className={`playlist-art playlist-art-${index % 4}`}><Headphones size={22} /></span><span><strong>{playlist.name}</strong><small>{playlist.book_ids.length} audiobooks</small></span></button>)}</div></>}
   </section>
 }
 
-function SearchPage({ books, query, setQuery, onOpen }: { books: Book[]; query: string; setQuery: (value: string) => void; onOpen: (book: Book) => void }) {
-  return <section className="search-page"><span className="eyebrow">FIND YOUR NEXT LISTEN</span><h1>Search</h1><label className="search-box"><Search size={19} /><Input autoFocus placeholder="Search audiobooks, authors, tags…" value={query} onChange={event => setQuery(event.target.value)} /><button type="button" aria-label="Clear search" onClick={() => setQuery('')} disabled={!query}>×</button></label><p className="search-results-count">{query ? `${books.length} matching audiobooks` : 'Search your collection by title, author, or tag.'}</p>{query && <div className="media-grid">{books.map((book, index) => <MediaCard key={book.id} book={book} index={index} favorite={false} rating={0} tags={[]} playlists={[]} onFavorite={() => {}} onRate={() => {}} onTag={() => {}} onAddToPlaylist={() => {}} onOpen={() => onOpen(book)} onPlay={() => onOpen(book)} />)}</div>}{query && !books.length && <div className="empty-state">No audiobooks match “{query}”.</div>}</section>
+function SearchPage({ query, setQuery, onOpen }: { query: string; setQuery: (value: string) => void; onOpen: (book: Book) => void }) {
+  const [books, setBooks] = useState<Book[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [total, setTotal] = useState(0)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const requestId = useRef(0)
+  const readPage = useCallback(async (next?: string) => {
+    const id = ++requestId.current
+    setLoading(true)
+    try {
+      const page = await api<{ items: Omit<Book, 'tracks'>[]; next_cursor: string | null; total: number }>(`/api/v1/books?q=${encodeURIComponent(query)}&limit=50${next ? `&cursor=${encodeURIComponent(next)}` : ''}`)
+      if (id !== requestId.current) return
+      const items = page.items.map(book => ({ ...book, tracks: [] }))
+      setBooks(previous => next ? uniqueBooks([...previous, ...items]) : items)
+      setCursor(page.next_cursor); setTotal(page.total); setError('')
+    } catch (e) { if (id === requestId.current) setError(e instanceof Error ? e.message : 'Could not search.') }
+    finally { if (id === requestId.current) setLoading(false) }
+  }, [query])
+  useEffect(() => {
+    setBooks([]); setCursor(null); setTotal(0); setError('')
+    const timer = window.setTimeout(() => { if (query.trim()) void readPage() }, 250)
+    return () => { window.clearTimeout(timer); requestId.current++ }
+  }, [query, readPage])
+  return <section className="search-page"><span className="eyebrow">FIND YOUR NEXT LISTEN</span><h1>Search</h1><label className="search-box"><Search size={19} /><Input autoFocus placeholder="Search audiobooks, authors, tags…" value={query} onChange={event => setQuery(event.target.value)} /><button type="button" aria-label="Clear search" onClick={() => setQuery('')} disabled={!query}>×</button></label><p className="search-results-count">{query ? `${total} matching audiobooks` : 'Search your collection by title, author, or tag.'}</p>{query && <div className="media-grid">{books.map((book, index) => <MediaCard key={book.id} book={book} index={index} favorite={false} rating={0} tags={[]} playlists={[]} onFavorite={() => {}} onRate={() => {}} onTag={() => {}} onAddToPlaylist={() => {}} onOpen={() => onOpen(book)} onPlay={() => onOpen(book)} />)}</div>}{error && <div className="empty-state">{error}<Button onClick={() => void readPage()}>Retry search</Button></div>}{cursor && <Button disabled={loading} onClick={() => void readPage(cursor)}>Load more</Button>}{loading && <p role="status">Searching…</p>}{query && !loading && !error && !books.length && <div className="empty-state">No audiobooks match “{query}”.</div>}</section>
 }
 
 function SectionHeader({ title, subtitle, action, onAction }: { title: string; subtitle?: string; action?: string; onAction?: () => void }) {
@@ -280,9 +316,7 @@ function LibraryPage({ groupMode, setGroupMode, onOpenGroup, books, allBooks, fe
     const book = allBooks.find(entry => entry.id === item.book_id)
     return book ? [{ item, book }] : []
   }).filter(({ book }) => {
-    const albumKey = book.album?.trim()
-      ? `${book.artist?.trim().toLocaleLowerCase() ?? ''}:${book.album.trim().toLocaleLowerCase()}`
-      : book.id
+    const albumKey = book.id
     if (seenRecentAlbums.has(albumKey)) return false
     seenRecentAlbums.add(albumKey)
     return true
@@ -294,7 +328,7 @@ function LibraryPage({ groupMode, setGroupMode, onOpenGroup, books, allBooks, fe
     <details className="filter-panel"><summary><SlidersHorizontal size={16} /><span>Filters and sort</span><span className="filter-summary-state">{statusFilter !== 'all' || favoritesOnly || sortBy !== 'title' ? 'Applied' : 'Optional'}</span></summary><div className="filter-panel-content"><div className="filter-options" role="group" aria-label="Filter audiobooks">{(['all', 'in-progress', 'not-started', 'completed'] as const).map(value => <button key={value} className={`filter-chip ${statusFilter === value ? 'active' : ''}`} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{value === 'all' ? 'All books' : value === 'in-progress' ? 'In progress' : value === 'not-started' ? 'Not started' : 'Finished'}</button>)}<button className={`filter-chip ${favoritesOnly ? 'active' : ''}`} aria-pressed={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)}>Favorites</button></div><label className="sort-control"><span>Sort by</span><select value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)} aria-label="Sort audiobooks"><option value="title">Title</option><option value="author">Author</option><option value="duration">Duration</option><option value="rating">Rating</option><option value="added">Added</option></select><select value={sortDirection} onChange={event => setSortDirection(event.target.value as typeof sortDirection)} aria-label="Sort direction"><option value="asc">Ascending</option><option value="desc">Descending</option></select></label></div></details>
     {featureError && <div className="empty-state">{featureError}</div>}
     {books.some(book => (book.progress?.position ?? 0) > 0) && <><div className="tracks-heading"><div><h2>Continue listening</h2><p>Your saved place</p></div></div><div className="resume-shelf">{books.filter(book => (book.progress?.position ?? 0) > 0).slice(0, 5).map(book => { const track = book.tracks.find(item => item.id === book.progress?.track_id); return track ? <button key={book.id} onClick={() => onPlay(book)}><Cover src={book.cover || '/icon.svg'} alt="" /><span><strong>{book.title}</strong><small>{track.title || track.name} · {duration(book.progress?.position ?? 0)} listened</small></span></button> : null })}</div></>}
-    {storage && <p className="storage-summary">{storage.tracks.toLocaleString()} files · {formatBytes(storage.bytes)} · {storage.formats.map(item => `${item.mime_type.replace('audio/', '').replace('application/', '')} ${item.count}`).join(' · ')}</p>}
+    {storage && <p className="storage-summary">{storage.tracks.toLocaleString()} files · {formatBytes(storage.source_bytes)} in Drive · {formatBytes(storage.cached_bytes)} cached · {storage.formats.map(item => `${item.mime_type.replace('audio/', '').replace('application/', '')} ${item.count}`).join(' · ')}</p>}
     {features.playlists.length > 0 && <div className="playlist-shelf"><strong>Playlists</strong><button className={!playlistView ? 'active' : ''} onClick={() => onPlaylistView(null)}>All books</button>{features.playlists.map(playlist => <span key={playlist.id}><button className={playlistView === playlist.id ? 'active' : ''} onClick={() => onPlaylistView(playlist.id)}>{playlist.name} · {playlist.book_ids.length}</button><button aria-label={`Delete ${playlist.name}`} onClick={() => { if (window.confirm(`Delete playlist “${playlist.name}”?`)) void api(`/api/playlists/${playlist.id}`, { method: 'DELETE' }).then(reloadFeatures) }}>×</button></span>)}<button onClick={onCreatePlaylist}><Plus size={14} /> New playlist</button></div>}
     {!features.playlists.length && <button className="create-playlist" onClick={onCreatePlaylist}><Plus size={14} /> Create playlist</button>}
     {features.history.length > 0 && <><div className="tracks-heading"><div><h2>Recently played</h2><p>Pick up where you left off</p></div></div><div className="media-grid recent-grid">{recentBooks.map(({ book }, index) => <MediaCard key={book.id} book={book} index={index} favorite={features.favorites.includes(book.id)} rating={features.ratings[book.id] ?? 0} tags={features.tags[book.id] ?? []} playlists={features.playlists} onFavorite={() => onFeature(book.id, 'favorite', !features.favorites.includes(book.id))} onRate={rating => onFeature(book.id, 'rating', rating)} onTag={() => { const tag = window.prompt('Add a tag'); if (tag?.trim()) onFeature(book.id, 'tags', [...(features.tags[book.id] ?? []), tag.trim()]) }} onAddToPlaylist={onAddToPlaylist} onOpen={() => onOpen(book)} onPlay={() => onPlay(book)} />)}</div></>}
@@ -304,7 +338,7 @@ function LibraryPage({ groupMode, setGroupMode, onOpenGroup, books, allBooks, fe
     {loading ? <LibrarySkeleton /> : !error && <GroupGrid books={books} mode={groupMode} sortBy={sortBy} sortDirection={sortDirection} ratings={features.ratings} onOpenGroup={onOpenGroup} />}
     {!loading && !error && books.length === 0 && <div className="empty-state">{query || statusFilter !== 'all' ? 'No audiobooks match these filters.' : 'No audiobooks found. Refresh after you sign in.'}</div>}
     {features.history.length > 0 && <div className="tracks-heading"><div><h2>Listening history</h2><p>Recent activity</p></div></div>}
-    {features.history.length > 0 && <div className="history-list">{features.history.slice(0, 10).map((item, index) => { const book = allBooks.find(entry => entry.id === item.book_id); const track = book?.tracks.find(entry => entry.id === item.track_id); return book && track ? <button key={`${item.book_id}-${item.played_at}-${index}`} onClick={() => onPlay(book)}><span>{book.title}</span><small>{track.title || track.name} · {new Date(item.played_at + 'Z').toLocaleString()}</small></button> : null })}</div>}
+    {features.history.length > 0 && <div className="history-list">{features.history.slice(0, 10).map((item, index) => { const book = allBooks.find(entry => entry.id === item.book_id); const track = book?.tracks.find(entry => entry.id === item.track_id); return book && track ? <button key={`${item.book_id}-${item.played_at}-${index}`} onClick={() => onPlay(book)}><span>{book.title}</span><small>{track.title || track.name} · {new Date(item.played_at.endsWith('Z') ? item.played_at : item.played_at.replace(' ', 'T') + 'Z').toLocaleString()}</small></button> : null })}</div>}
   </section>
 }
 
@@ -401,12 +435,11 @@ function BookSkeleton() {
 }
 
 function MediaCard({ book, index, favorite, rating, tags, playlists, onFavorite, onRate, onTag, onAddToPlaylist, onOpen, onPlay }: { book: Book; index: number; favorite: boolean; rating: number; tags: string[]; playlists: Features['playlists']; onFavorite: () => void; onRate: (rating: number) => void; onTag: () => void; onAddToPlaylist: (playlistId: string, bookId: string) => void; onOpen: () => void; onPlay: () => void }) {
-  const track = book.tracks.find(item => item.id === book.progress?.track_id)
-  const percent = track?.duration ? Math.min(100, Math.round(book.progress!.position / track.duration * 100)) : 0
+  const percent = Math.round((book.progress?.fraction ?? 0) * 100)
   return <Card className="media-card media-card-enter" style={{ '--card-index': Math.min(index, 12) } as CSSProperties}><button className="cover-action" onClick={onOpen} aria-label={`Open ${book.title}`}><Cover className="media-cover" src={book.cover || '/icon.svg'} alt={`${book.title} cover`} /><span className="hover-play" onClick={event => { event.stopPropagation(); onPlay() }}><PlayIcon /></span></button>
     <button className="favorite-toggle" aria-label={favorite ? 'Remove favorite' : 'Add favorite'} aria-pressed={favorite} onClick={onFavorite}><Heart size={16} fill={favorite ? 'currentColor' : 'none'} /></button>
     <button className="media-title" onClick={onOpen}>{book.title}</button><div className="media-artist">{book.artist || 'Audiobook'}</div>
-    <div className="media-meta"><span>{book.tracks.length} {book.tracks.length === 1 ? 'part' : 'parts'}</span><span>{duration(book.duration)}</span></div>
+    <div className="media-meta"><span>{book.track_count ?? book.tracks.length} {(book.track_count ?? book.tracks.length) === 1 ? 'part' : 'parts'}</span><span>{duration(book.duration)}</span></div>
     {rating > 0 && <div className="book-rating" aria-label={`Rating: ${rating} out of 5`}>{Array.from({ length: rating }, (_, i) => <Star size={12} fill="currentColor" key={i} />)}</div>}
     {tags.length > 0 && <div className="book-tags">{tags.map(tag => <span key={tag}>{tag}</span>)}</div>}
     {book.progress && <div className="resume-indicator">Continue · {Math.floor(book.progress.position / 60)} min</div>}

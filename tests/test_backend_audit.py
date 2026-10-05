@@ -352,7 +352,7 @@ def test_progress_contention_does_not_block_other_requests(tmp_path: Path) -> No
             cookies={"session": cookie},
         ) as ac:
             pending = asyncio.create_task(
-                ac.put("/api/progress/book-key", json={"track_id": "drive-track", "position": 12})
+                ac.put("/api/progress/book-key", json={"track_id": "drive-track", "position": 12, "base_revision": 0, "event_id": "heartbeat"})
             )
             try:
                 response = await asyncio.wait_for(ac.get("/api/books/book-key"), timeout=1)

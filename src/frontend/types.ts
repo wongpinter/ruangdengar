@@ -10,7 +10,7 @@ export type Track = {
   chapter_count?: number
   format?: string
 }
-export type Progress = { track_id: string; position: number; updated_at?: string }
+export type Progress = { track_id: string; position: number; updated_at?: string; revision?: number; completed?: boolean; book_position?: number; fraction?: number | null; status?: 'not-started' | 'in-progress' | 'completed' }
 export type MetadataCandidate = { source: 'Google Books' | 'Open Library'; source_id: string; title: string; authors: string[]; description?: string; publisher?: string; published_date?: string; isbn?: string; cover?: string }
 export type Book = {
   id: string
@@ -22,6 +22,10 @@ export type Book = {
   cover?: string | null
   duration: number
   added_at?: string
+  track_count?: number
+  favorite?: boolean
+  rating?: number | null
+  tags?: string[]
   tracks: Track[]
   progress?: Progress | null
 }
