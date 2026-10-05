@@ -15,12 +15,12 @@ import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Annotated, Any, BinaryIO
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -31,9 +31,27 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import Receive, Scope, Send
 
+from .api_models import (
+    BookPage,
+    BookResponse,
+    BootstrapResponse,
+    BoundedBootstrapResponse,
+    ChapterPage,
+    FeaturesResponse,
+    HistoryPage,
+    PlaybackResponse,
+    PlaylistBooksResponse,
+    PlaylistResponse,
+    ProgressResponse,
+    ScanResponse,
+    StorageResponse,
+    WarmResponse,
+)
+from .catalog import CatalogQueries, bump_revision, migrate_catalog, write_projection
 from .models import SOURCE_GDRIVE, Chapter, Cover, TrackMeta
 from .naming import group_tracks
 from .probe import probe
@@ -51,7 +69,15 @@ class RequestBody(BaseModel):
 
 class ProgressBody(RequestBody):
     track_id: StrictStr
-    position: Annotated[float, Field(strict=True, ge=0, le=10_000_000)] = 0
+    position: Annotated[float, Field(strict=True, ge=0, le=10_000_000, allow_inf_nan=False)] = 0
+    base_revision: Annotated[StrictInt, Field(ge=0)] | None = None
+    event_id: Annotated[StrictStr, Field(min_length=1, max_length=128)] | None = None
+    completed: StrictBool | None = None
+
+
+class ConditionalProgressBody(ProgressBody):
+    base_revision: Annotated[StrictInt, Field(ge=0)]
+    event_id: Annotated[StrictStr, Field(min_length=1, max_length=128)]
 
 
 class FavoriteBody(RequestBody):
@@ -72,10 +98,12 @@ class PlaylistBody(RequestBody):
 
 class PlaylistBooksBody(RequestBody):
     book_ids: Annotated[list[StrictStr], Field(max_length=1000)]
+    base_revision: Annotated[StrictInt, Field(ge=0)] | None = None
 
 
 class HistoryBody(RequestBody):
     track_id: StrictStr
+    position: Annotated[float, Field(strict=True, ge=0, le=10_000_000, allow_inf_nan=False)] = 0
 
 
 class ExclusionsBody(RequestBody):
@@ -249,7 +277,7 @@ class WebConfig:
             raise RuntimeError("Missing required settings: " + ", ".join(missing))
 
 
-class Database:
+class Database(CatalogQueries):
     def __init__(self, path: Path) -> None:
         self.path = path
         self.auth_lock = threading.RLock()
@@ -386,12 +414,14 @@ class Database:
                         "INSERT OR IGNORE INTO book_overrides VALUES(?,?)",
                         (row["id"], json.dumps(overrides)),
                     )
+            migrate_catalog(db)
         self.path.chmod(0o600)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path, timeout=15)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
         try:
             yield db
             db.commit()
@@ -466,34 +496,6 @@ class Database:
         with self.connect() as db:
             return dict(db.execute("SELECT track_id,book_id FROM track_identity").fetchall())
 
-    def library(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            books = db.execute("SELECT data FROM books ORDER BY title COLLATE NOCASE").fetchall()
-            progress = {row["book_id"]: dict(row) for row in db.execute("SELECT * FROM progress")}
-        output = []
-        features = self.feature_data()
-        for row in books:
-            book = json.loads(row["data"])
-            book["progress"] = progress.get(book["id"])
-            book["favorite"] = book["id"] in features["favorites"]
-            book["rating"] = features["ratings"].get(book["id"])
-            book["tags"] = features["tags"].get(book["id"], [])
-            for track in book.get("tracks", []):
-                track["chapter_count"] = track.get("chapter_count", len(track.get("chapters", [])))
-                track["chapters"] = []
-            output.append(book)
-        return output
-
-    def book(self, book_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            row = db.execute("SELECT data FROM books WHERE id=?", (book_id,)).fetchone()
-            progress = db.execute("SELECT * FROM progress WHERE book_id=?", (book_id,)).fetchone()
-        if row is None:
-            return None
-        book: dict[str, Any] = json.loads(row["data"])
-        book["progress"] = dict(progress) if progress else None
-        return book
-
     def update_book_metadata(self, book_id: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
             "title",
@@ -505,6 +507,7 @@ class Database:
             "published_date",
             "isbn",
             "cover",
+            "metadata_source",
         }
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -523,12 +526,21 @@ class Database:
                 "UPDATE books SET title=?,artist=?,cover=?,data=? WHERE id=?",
                 (book["title"], book.get("artist"), book.get("cover"), json.dumps(book), book_id),
             )
-        return book
+            bump_revision(db)
+        return self.book(book_id, include_chapters=False)
 
-    def track(self, track_id: str) -> dict[str, Any] | None:
+    def track(self, track_id: str, include_chapters: bool = False) -> dict[str, Any] | None:
         with self.connect() as db:
             row = db.execute("SELECT data FROM tracks WHERE id=?", (track_id,)).fetchone()
-        return json.loads(row["data"]) if row else None
+            track = json.loads(row["data"]) if row else None
+            if track is not None and include_chapters:
+                track["chapters"] = [
+                    json.loads(chapter[0])
+                    for chapter in db.execute(
+                        "SELECT data FROM chapters WHERE track_id=? ORDER BY ordinal", (track_id,)
+                    )
+                ]
+            return track
 
     def save_library(self, books: list[dict[str, Any]], tracks: list[dict[str, Any]]) -> None:
         with self.connect() as db:
@@ -542,38 +554,16 @@ class Database:
                 if saved:
                     book["metadata_overrides"] = saved
                     book.update(saved)
-            db.execute("DELETE FROM tracks")
-            db.execute("DELETE FROM books")
-            db.executemany(
-                "INSERT INTO books(id,title,artist,cover,duration,data) VALUES(?,?,?,?,?,?)",
-                [
-                    (
-                        b["id"],
-                        b["title"],
-                        b.get("artist"),
-                        b.get("cover"),
-                        b["duration"],
-                        json.dumps(b),
-                    )
-                    for b in books
-                ],
-            )
-            db.executemany(
-                "INSERT INTO tracks(id,book_id,name,path,size,mime_type,data) "
-                "VALUES(?,?,?,?,?,?,?)",
-                [
-                    (
-                        t["id"],
-                        t["book_id"],
-                        t["name"],
-                        t["path"],
-                        t.get("size") or 0,
-                        t.get("mime_type"),
-                        json.dumps(t),
-                    )
-                    for t in tracks
-                ],
-            )
+            # Retain identities throughout publication; delete only vanished records.
+            write_projection(db, books, tracks)
+            db.execute("CREATE TEMP TABLE live_books(id TEXT PRIMARY KEY)")
+            db.execute("CREATE TEMP TABLE live_tracks(id TEXT PRIMARY KEY)")
+            db.executemany("INSERT INTO live_books VALUES(?)", [(b["id"],) for b in books])
+            db.executemany("INSERT INTO live_tracks VALUES(?)", [(t["id"],) for t in tracks])
+            db.execute("DELETE FROM tracks WHERE id NOT IN (SELECT id FROM live_tracks)")
+            db.execute("DELETE FROM books WHERE id NOT IN (SELECT id FROM live_books)")
+            db.execute("DELETE FROM progress_events WHERE book_id NOT IN (SELECT id FROM books)")
+            bump_revision(db)
 
             db.executemany(
                 "INSERT OR REPLACE INTO track_identity VALUES(?,?)",
@@ -613,6 +603,7 @@ class Database:
                     "error": "",
                 }
             )
+            new_job = values.get("status") == "running" and status.get("status") != "running"
             status.update({key: value for key, value in values.items() if key in fields})
             db.execute(
                 "INSERT INTO scan_state (id,status,total,processed,current,error) "
@@ -621,6 +612,10 @@ class Database:
                 "current=excluded.current,error=excluded.error,updated_at=CURRENT_TIMESTAMP",
                 [status[key] for key in fields],
             )
+            if new_job or not status.get("job_id"):
+                db.execute(
+                    "UPDATE scan_state SET job_id=? WHERE id=1", (secrets.token_urlsafe(16),)
+                )
 
     def pending_scan_items(self) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -786,25 +781,13 @@ class Database:
         self.mark_scan_directory(folder_id, scanned=True)
 
     def save_progress(self, book_id: str, track_id: str, position: float) -> None:
-        with self.book_write(book_id) as db:
-            if (
-                db.execute(
-                    "SELECT 1 FROM tracks WHERE id=? AND book_id=?", (track_id, book_id)
-                ).fetchone()
-                is None
-            ):
-                raise HTTPException(422, "track does not belong to this book")
-            db.execute(
-                """INSERT INTO progress(book_id,track_id,position,updated_at)
-                VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                ON CONFLICT(book_id) DO UPDATE SET
-                track_id=excluded.track_id, position=excluded.position,
-                updated_at=excluded.updated_at""",
-                (book_id, track_id, position),
-            )
+        # Legacy/internal compatibility; versioned API requires conditional writes.
+        self.checkpoint(book_id, track_id, position)
 
-    def feature_data(self) -> dict[str, Any]:
-        with self.connect() as db:
+    def feature_data(self, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+        with nullcontext(connection) if connection is not None else self.connect() as db:
+            if not db.in_transaction:
+                db.execute("BEGIN")
             favorites = [row[0] for row in db.execute("SELECT book_id FROM favorites")]
             ratings = {row[0]: row[1] for row in db.execute("SELECT book_id,rating FROM ratings")}
             tags: dict[str, list[str]] = {}
@@ -813,14 +796,13 @@ class Database:
             playlists = [
                 dict(row) for row in db.execute("SELECT * FROM playlists ORDER BY created_at")
             ]
+            membership: dict[str, list[str]] = {}
+            for row in db.execute(
+                "SELECT playlist_id,book_id FROM playlist_books ORDER BY position"
+            ):
+                membership.setdefault(row[0], []).append(row[1])
             for playlist in playlists:
-                playlist["book_ids"] = [
-                    row[0]
-                    for row in db.execute(
-                        "SELECT book_id FROM playlist_books WHERE playlist_id=? ORDER BY position",
-                        (playlist["id"],),
-                    )
-                ]
+                playlist["book_ids"] = membership.get(playlist["id"], [])
             history = [
                 dict(row)
                 for row in db.execute(
@@ -892,12 +874,23 @@ class Database:
                     db.execute("DELETE FROM playlist_books WHERE book_id=?", (row["id"],))
                     db.execute("DELETE FROM books WHERE id=?", (row["id"],))
                 elif removed:
+                    for ordinal, track in enumerate(kept):
+                        track["ordinal"] = ordinal
+                        db.execute(
+                            "UPDATE tracks SET ordinal=?,data=json_set(data,'$.ordinal',?) "
+                            "WHERE id=?",
+                            (ordinal, ordinal, track["id"]),
+                        )
                     book["tracks"] = kept
+                    book["track_count"] = len(kept)
                     book["duration"] = sum(track.get("duration", 0) for track in kept)
                     db.execute(
                         "UPDATE books SET duration=?,data=? WHERE id=?",
                         (book["duration"], json.dumps(book), row["id"]),
                     )
+                    db.execute("UPDATE books SET track_count=? WHERE id=?", (len(kept), row["id"]))
+            db.execute("DELETE FROM progress_events WHERE book_id NOT IN (SELECT id FROM books)")
+            bump_revision(db)
 
     def record_history(self, book_id: str, track_id: str, position: float = 0) -> None:
         with self.book_write(book_id) as db:
@@ -1240,7 +1233,7 @@ class LibraryScanner:
         previous = self.db.identities()
         for item in items:
             if item.get("error") and item["id"] in previous:
-                old = self.db.track(item["id"])
+                old = self.db.track(item["id"], include_chapters=True)
                 if old:
                     item = dict(item)
                     item["meta"] = old.get("probe_meta", {**item["meta"], **old})
@@ -1390,7 +1383,31 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         config.check()
         yield
 
-    app = FastAPI(title="RuangDengar", lifespan=lifespan)
+    app = FastAPI(title="RuangDengar", version="1.0", lifespan=lifespan)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def api_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        detail = exc.detail
+        codes = {
+            401: "unauthorized",
+            403: "forbidden",
+            404: "not_found",
+            405: "method_not_allowed",
+            409: "conflict",
+            428: "precondition_required",
+            503: "service_unavailable",
+            422: "invalid_request",
+            502: "upstream_error",
+        }
+        code = (
+            detail.get("code", "conflict")
+            if isinstance(detail, dict)
+            else codes.get(exc.status_code, "request_failed")
+        )
+        return JSONResponse(
+            {"detail": detail, "code": code}, status_code=exc.status_code, headers=exc.headers
+        )
+
     app.add_middleware(
         SessionMiddleware,
         secret_key=config.secret or secrets.token_urlsafe(48),
@@ -1426,6 +1443,8 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 bool(set_cookie),
                 "secure" in set_cookie.lower(),
             )
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "private, no-store"
         return response
 
     def user(request: Request) -> str:
@@ -1537,7 +1556,88 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         db.disconnect(config.credentials_path)
         return Response(status_code=204)
 
-    @app.get("/api/library")
+    @app.get("/api/v1/books", response_model=BookPage)
+    def paged_books(
+        request: Request,
+        q: str = Query("", max_length=200),
+        sort: str = "title",
+        direction: str = "asc",
+        status: str = "all",
+        favorite: bool = False,
+        playlist_id: str | None = None,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: str | None = Query(None, max_length=2048),
+    ) -> dict[str, Any]:
+        user(request)
+        return db.catalog_page(
+            q=q,
+            sort=sort,
+            direction=direction,
+            status=status,
+            favorite=favorite,
+            playlist_id=playlist_id,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @app.get("/api/v1/books/{book_id}/playback", response_model=PlaybackResponse)
+    def playback(book_id: str, request: Request) -> dict[str, Any]:
+        user(request)
+        book = db.book(book_id, include_chapters=False)
+        if book is None:
+            raise HTTPException(404, "Book not found")
+        return {
+            "book_id": book_id,
+            "tracks": book["tracks"],
+            "progress": book["progress"],
+            "revision": db.revision(),
+        }
+
+    @app.get("/api/v1/history", response_model=HistoryPage)
+    def history_page(
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        cursor: int | None = Query(None, ge=1),
+    ) -> dict[str, Any]:
+        user(request)
+        with db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM listening_history WHERE id<? ORDER BY id DESC LIMIT ?",
+                (cursor or 9223372036854775807, limit + 1),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows[:limit]],
+            "next_cursor": rows[limit - 1]["id"] if len(rows) > limit else None,
+        }
+
+    @app.get("/api/bootstrap", response_model=BootstrapResponse)
+    def bootstrap(request: Request) -> dict[str, Any]:
+        user(request)
+        db.sync_credentials(config.credentials_path)
+        # One database snapshot for catalog, personal state, totals, and revision.
+        with db.connect() as connection:
+            connection.execute("BEGIN")
+            state = connection.execute("SELECT * FROM scan_state WHERE id=1").fetchone()
+            return {
+                "books": db.library(connection),
+                "features": db.feature_data(connection),
+                "storage": storage_info(connection),
+                "scan": dict(state) if state else {"status": "idle"},
+                "revision": connection.execute(
+                    "SELECT revision FROM catalog_state WHERE id=1"
+                ).fetchone()[0],
+            }
+
+    @app.get("/api/v1/bootstrap", response_model=BoundedBootstrapResponse)
+    def bounded_bootstrap(request: Request) -> dict[str, Any]:
+        user(request)
+        return {
+            "books": db.catalog_page(limit=20),
+            "scan": db.scan_status() or {"status": "idle"},
+            "capabilities": {"conditional_progress": True, "playlist_items": True},
+        }
+
+    @app.get("/api/library", response_model=list[BookResponse])
     def library(request: Request, refresh: bool = False) -> list[dict[str, Any]]:
         user(request)
         try:
@@ -1545,18 +1645,20 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
         books = db.library()
-        if refresh or not books:
-            scanner.start()
+        if refresh:
+            raise HTTPException(405, "Use POST /api/v1/scan-jobs to scan the library")
         return books
 
-    @app.post("/api/library/refresh")
+    @app.post("/api/v1/scan-jobs", status_code=202, response_model=ScanResponse)
+    @app.post("/api/library/refresh", response_model=ScanResponse)
     def library_refresh(request: Request, retry_failed: bool = True) -> dict[str, Any]:
         user(request)
         if not scanner.start(retry_failed=retry_failed):
             raise HTTPException(409, "Library scan is already running")
-        return {"status": "running"}
+        return db.scan_status() or {"status": "running"}
 
-    @app.get("/api/library/scan")
+    @app.get("/api/v1/scan-jobs/current", response_model=ScanResponse)
+    @app.get("/api/library/scan", response_model=ScanResponse)
     def library_scan(request: Request) -> dict[str, Any]:
         user(request)
         return scanner.db.scan_status() or {
@@ -1567,6 +1669,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             "error": "",
         }
 
+    @app.get("/api/v1/scan-jobs/current/events")
     @app.get("/api/library/events")
     def library_events(request: Request) -> StreamingResponse:
         user(request)
@@ -1596,10 +1699,11 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
 
         return StreamingResponse(stream_events(), media_type="text/event-stream")
 
-    @app.get("/api/books/{book_id}")
+    @app.get("/api/v1/books/{book_id}", response_model=BookResponse)
+    @app.get("/api/books/{book_id}", response_model=BookResponse)
     def get_book(book_id: str, request: Request) -> dict[str, Any]:
         user(request)
-        book = db.book(book_id)
+        book = db.book(book_id, include_chapters=False)
         if book is None:
             raise HTTPException(404, "Book not found")
         if book.get("tracks"):
@@ -1695,7 +1799,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             )
         return {"candidates": candidates, "source_errors": source_errors}
 
-    @app.post("/api/books/{book_id}/metadata/apply")
+    @app.post("/api/books/{book_id}/metadata/apply", response_model=BookResponse)
     async def apply_book_metadata(
         book_id: str, request: Request, input_data: MetadataBody
     ) -> dict[str, Any]:
@@ -1722,11 +1826,21 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 if body["source"] == "Google Books":
                     info = payload.get("volumeInfo", {})
                 else:
+                    authors = []
+                    for entry in payload.get("authors", [])[:10]:
+                        key = entry.get("author", {}).get("key", "")
+                        if re.fullmatch(r"/authors/OL[0-9]+A", key):
+                            author_response = await client.get(f"https://openlibrary.org{key}.json")
+                            author_response.raise_for_status()
+                            name = author_response.json().get("name")
+                            if isinstance(name, str):
+                                authors.append(name)
                     info = {
                         "title": payload.get("title"),
                         "description": payload.get("description"),
-                        "authors": [],
+                        "authors": authors,
                         "covers": payload.get("covers", []),
+                        "publishedDate": payload.get("first_publish_date", ""),
                     }
         except (httpx.HTTPError, ValueError) as exc:
             raise HTTPException(502, "Could not load selected metadata") from exc
@@ -1743,10 +1857,14 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         cover = image_links.get("thumbnail") or ""
         if body["source"] == "Open Library" and info.get("covers"):
             cover = f"https://covers.openlibrary.org/b/id/{info['covers'][0]}-L.jpg"
+        description = info.get("description") or ""
+        if isinstance(description, dict):
+            description = description.get("value", "")
         metadata = {
+            "metadata_source": {"source": body["source"], "source_id": body["source_id"]},
             "title": info.get("title"),
             "artist": ", ".join(info.get("authors", [])) if info.get("authors") else None,
-            "description": info.get("description", ""),
+            "description": str(description),
             "publisher": info.get("publisher", ""),
             "published_date": info.get("publishedDate", ""),
             "isbn": isbn,
@@ -1761,33 +1879,24 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             raise HTTPException(404, "Book not found")
         return updated
 
-    @app.put("/api/progress/{book_id}")
+    @app.put("/api/v1/books/{book_id}/progress", response_model=ProgressResponse)
+    def conditional_progress(
+        book_id: str, request: Request, payload: ConditionalProgressBody
+    ) -> dict[str, Any]:
+        user(request)
+        return db.checkpoint(book_id, **payload.model_dump())
+
+    @app.put("/api/progress/{book_id}", response_model=ProgressResponse)
     def progress(book_id: str, request: Request, payload: ProgressBody) -> dict[str, Any]:
         user(request)
-        book = db.book(book_id)
-        if book is None:
-            raise HTTPException(404, "Book not found")
-        if not isinstance(body := payload.model_dump(), dict):
-            raise HTTPException(422, "request body must be a JSON object")
-        track_id = str(body.get("track_id", ""))
-        try:
-            position = float(body.get("position", 0))
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(422, "position must be a number") from exc
-        if not 0 <= position <= 10_000_000:
-            raise HTTPException(422, "position is out of range")
-        if not any(track["id"] == track_id for track in book["tracks"]):
-            raise HTTPException(422, "track does not belong to this book")
-        db.save_progress(book_id, track_id, position)
-        return {"book_id": book_id, "track_id": track_id, "position": position}
+        if payload.base_revision is None or payload.event_id is None:
+            raise HTTPException(428, "base_revision and event_id are required; read progress first")
+        return db.checkpoint(book_id, **payload.model_dump())
 
-    @app.get("/api/features")
+    @app.get("/api/features", response_model=FeaturesResponse)
     def features(request: Request) -> dict[str, Any]:
         user(request)
-        data = db.feature_data()
-        known = {book["id"] for book in db.library()}
-        data["favorites"] = [book_id for book_id in data["favorites"] if book_id in known]
-        return data
+        return db.feature_data()
 
     @app.put("/api/books/{book_id}/favorite")
     def favorite(book_id: str, request: Request, payload: FavoriteBody) -> dict[str, bool]:
@@ -1802,6 +1911,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 connection.execute("INSERT OR IGNORE INTO favorites(book_id) VALUES(?)", (book_id,))
             else:
                 connection.execute("DELETE FROM favorites WHERE book_id=?", (book_id,))
+            bump_revision(connection)
         return {"favorite": body["favorite"]}
 
     @app.put("/api/books/{book_id}/rating")
@@ -1824,6 +1934,7 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                     "ON CONFLICT(book_id) DO UPDATE SET rating=excluded.rating",
                     (book_id, value),
                 )
+            bump_revision(connection)
         return {"rating": value}
 
     @app.put("/api/books/{book_id}/tags")
@@ -1850,9 +1961,10 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             connection.executemany(
                 "INSERT INTO book_tags(book_id,tag) VALUES(?,?)", [(book_id, tag) for tag in clean]
             )
+            bump_revision(connection)
         return {"tags": clean}
 
-    @app.post("/api/playlists", status_code=201)
+    @app.post("/api/playlists", status_code=201, response_model=PlaylistResponse)
     def create_playlist(request: Request, payload: PlaylistBody) -> dict[str, Any]:
         user(request)
         body = payload.model_dump()
@@ -1866,12 +1978,13 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         playlist_id = secrets.token_urlsafe(12)
         with db.connect() as connection:
             connection.execute("INSERT INTO playlists(id,name) VALUES(?,?)", (playlist_id, name))
-        return {"id": playlist_id, "name": name, "book_ids": []}
+        return {"id": playlist_id, "name": name, "book_ids": [], "revision": 0}
 
-    @app.put("/api/playlists/{playlist_id}/books")
+    @app.put("/api/v1/playlists/{playlist_id}/books", response_model=PlaylistBooksResponse)
+    @app.put("/api/playlists/{playlist_id}/books", response_model=PlaylistBooksResponse)
     def playlist_books(
         playlist_id: str, request: Request, payload: PlaylistBooksBody
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, Any]:
         user(request)
         body = payload.model_dump()
         ids = body.get("book_ids") if isinstance(body, dict) else None
@@ -1882,9 +1995,6 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             or len(set(ids)) != len(ids)
         ):
             raise HTTPException(422, "book_ids must be a unique list of at most 1000 IDs")
-        known = {book["id"] for book in db.library()}
-        if any(item not in known for item in ids):
-            raise HTTPException(422, "all playlist books must exist in the library")
         with db.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = {row[0] for row in connection.execute("SELECT id FROM books")}
@@ -1895,12 +2005,83 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
                 is None
             ):
                 raise HTTPException(404, "Playlist not found")
+            revision = connection.execute(
+                "SELECT revision FROM playlists WHERE id=?", (playlist_id,)
+            ).fetchone()[0]
+            if payload.base_revision is None:
+                raise HTTPException(428, "base_revision is required for playlist replacement")
+            if payload.base_revision != revision:
+                raise HTTPException(409, "Playlist changed; reload before reordering")
             connection.execute("DELETE FROM playlist_books WHERE playlist_id=?", (playlist_id,))
             connection.executemany(
                 "INSERT INTO playlist_books(playlist_id,book_id,position) VALUES(?,?,?)",
                 [(playlist_id, book_id, i) for i, book_id in enumerate(ids)],
             )
-        return {"book_ids": ids}
+            connection.execute(
+                "UPDATE playlists SET revision=revision+1 WHERE id=?", (playlist_id,)
+            )
+            bump_revision(connection)
+        return {"book_ids": ids, "revision": revision + 1}
+
+    @app.put("/api/v1/playlists/{playlist_id}/books/{book_id}", response_model=PlaylistResponse)
+    @app.put("/api/playlists/{playlist_id}/books/{book_id}", response_model=PlaylistResponse)
+    def add_playlist_book(playlist_id: str, book_id: str, request: Request) -> dict[str, Any]:
+        user(request)
+        return change_playlist_item(playlist_id, book_id, True)
+
+    @app.delete("/api/v1/playlists/{playlist_id}/books/{book_id}", response_model=PlaylistResponse)
+    @app.delete("/api/playlists/{playlist_id}/books/{book_id}", response_model=PlaylistResponse)
+    def remove_playlist_book(playlist_id: str, book_id: str, request: Request) -> dict[str, Any]:
+        user(request)
+        return change_playlist_item(playlist_id, book_id, False)
+
+    def change_playlist_item(playlist_id: str, book_id: str, add: bool) -> dict[str, Any]:
+        with db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            playlist = connection.execute(
+                "SELECT * FROM playlists WHERE id=?", (playlist_id,)
+            ).fetchone()
+            if playlist is None:
+                raise HTTPException(404, "Playlist not found")
+            if add:
+                if not connection.execute("SELECT 1 FROM books WHERE id=?", (book_id,)).fetchone():
+                    raise HTTPException(404, "Book not found")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM playlist_books WHERE playlist_id=?", (playlist_id,)
+                ).fetchone()[0]
+                exists = connection.execute(
+                    "SELECT 1 FROM playlist_books WHERE playlist_id=? AND book_id=?",
+                    (playlist_id, book_id),
+                ).fetchone()
+                if count >= 1000 and not exists:
+                    raise HTTPException(422, "Playlist is full")
+                changed = connection.execute(
+                    "INSERT OR IGNORE INTO playlist_books "
+                    "SELECT ?,?,COALESCE(MAX(position),-1)+1 FROM playlist_books "
+                    "WHERE playlist_id=?",
+                    (playlist_id, book_id, playlist_id),
+                ).rowcount
+            else:
+                changed = connection.execute(
+                    "DELETE FROM playlist_books WHERE playlist_id=? AND book_id=?",
+                    (playlist_id, book_id),
+                ).rowcount
+            if changed:
+                connection.execute(
+                    "UPDATE playlists SET revision=revision+1 WHERE id=?", (playlist_id,)
+                )
+                bump_revision(connection)
+            result = dict(
+                connection.execute("SELECT * FROM playlists WHERE id=?", (playlist_id,)).fetchone()
+            )
+            result["book_ids"] = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT book_id FROM playlist_books WHERE playlist_id=? ORDER BY position",
+                    (playlist_id,),
+                )
+            ]
+            return result
 
     @app.delete("/api/playlists/{playlist_id}", status_code=204)
     def delete_playlist(playlist_id: str, request: Request) -> Response:
@@ -1922,7 +2103,10 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         book = db.book(book_id)
         if book is None or not any(track["id"] == track_id for track in book["tracks"]):
             raise HTTPException(422, "track does not belong to this book")
-        db.record_history(book_id, track_id)
+        selected = next(track for track in book["tracks"] if track["id"] == track_id)
+        if selected.get("duration") and payload.position > selected["duration"] + 2:
+            raise HTTPException(422, "position is outside track duration")
+        db.record_history(book_id, track_id, payload.position)
         return Response(status_code=204)
 
     @app.get("/api/directories")
@@ -1969,51 +2153,52 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
         user(request)
         return {"excluded_directories": db.excluded_directories()}
 
-    @app.get("/api/storage")
+    @app.get("/api/v1/storage", response_model=StorageResponse)
+    @app.get("/api/storage", response_model=StorageResponse)
     def storage(request: Request) -> dict[str, Any]:
         user(request)
         with db.connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(size),0) FROM tracks"
-            ).fetchone()
-            formats = connection.execute(
-                "SELECT mime_type, COUNT(*) FROM tracks GROUP BY mime_type ORDER BY COUNT(*) DESC"
-            ).fetchall()
+            return storage_info(connection)
+
+    def storage_info(connection: sqlite3.Connection) -> dict[str, Any]:
+        row = connection.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM tracks").fetchone()
+        formats = connection.execute(
+            "SELECT mime_type, COUNT(*) FROM tracks GROUP BY mime_type ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        with cache.lock:
+            cached_bytes = sum(
+                path.stat().st_size
+                for path in cache.path.iterdir()
+                if path.is_file() and not path.name.endswith(".part")
+            )
         return {
             "tracks": row[0],
             "bytes": row[1],
+            "source_bytes": row[1],
+            "cached_bytes": cached_bytes,
+            "cache_budget_bytes": cache.max_bytes,
+            "cache_enabled": config.cache_warm_enabled and cache.max_bytes > 0,
             "formats": [{"mime_type": item[0] or "unknown", "count": item[1]} for item in formats],
         }
 
-    @app.get("/api/progress/{book_id}")
+    @app.get("/api/v1/books/{book_id}/progress", response_model=ProgressResponse | None)
+    @app.get("/api/progress/{book_id}", response_model=ProgressResponse | None)
     def get_progress(book_id: str, request: Request) -> dict[str, Any] | None:
         user(request)
-        book = db.book(book_id)
+        book = db.book(book_id, include_chapters=False)
         if book is None:
             raise HTTPException(404, "Book not found")
-        with db.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM progress WHERE book_id=?", (book_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        return book["progress"]
 
-    @app.get("/api/tracks/{track_id}/chapters")
+    @app.get("/api/v1/tracks/{track_id}/chapters", response_model=ChapterPage)
+    @app.get("/api/tracks/{track_id}/chapters", response_model=ChapterPage)
     def track_chapters(
         track_id: str, request: Request, offset: int = 0, limit: int = 50
     ) -> dict[str, Any]:
         user(request)
         if offset < 0 or not 1 <= limit <= 100:
             raise HTTPException(422, "offset must be non-negative and limit must be 1..100")
-        track = db.track(track_id)
-        if track is None:
-            raise HTTPException(404, "Track not found")
-        book = db.book(track["book_id"])
-        if book is None or not any(item["id"] == track_id for item in book["tracks"]):
-            raise HTTPException(404, "Track not found")
-        chapters = next(item["chapters"] for item in book["tracks"] if item["id"] == track_id)
-        page = chapters[offset : offset + limit]
-        next_offset = offset + len(page) if offset + len(page) < len(chapters) else None
-        return {"track_id": track_id, "chapters": page, "next_offset": next_offset}
+        return db.chapter_page(track_id, offset, limit)
 
     @app.head("/api/tracks/{track_id}/audio")
     def audio_head(track_id: str, request: Request) -> Response:
@@ -2030,15 +2215,23 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
             headers={"Content-Length": str(size), "Accept-Ranges": "bytes"},
         )
 
-    @app.post("/api/tracks/{track_id}/warm", status_code=202)
-    def warm_audio(track_id: str, request: Request) -> Response:
+    @app.post("/api/tracks/{track_id}/warm", response_model=WarmResponse)
+    def warm_audio(track_id: str, request: Request) -> JSONResponse:
         user(request)
         track = db.track(track_id)
         if track is None:
             raise HTTPException(404, "Track not found")
-        if not schedule_warm(track):
-            return Response(status_code=204)
-        return Response(status_code=202)
+        if cache.file(track) is not None:
+            status, code = "available", 200
+        elif not config.cache_warm_enabled or cache.max_bytes <= 0:
+            status, code = "disabled", 200
+        elif int(track.get("size") or 0) > cache.max_bytes:
+            status, code = "too_large", 200
+        elif not schedule_warm(track):
+            status, code = "busy", 200
+        else:
+            status, code = "queued", 202
+        return JSONResponse({"status": status}, status_code=code)
 
     @app.get("/api/tracks/{track_id}/audio")
     def audio(track_id: str, request: Request) -> Response:
@@ -2280,6 +2473,8 @@ def create_app(config: WebConfig | None = None, db: Database | None = None) -> F
 
     @app.get("/{client_path:path}", response_class=HTMLResponse)
     def client_route(client_path: str) -> FileResponse:
+        if client_path == "api" or client_path.startswith("api/"):
+            raise HTTPException(404, "API route not found")
         return FileResponse(static_dir / "index.html", headers={"Cache-Control": "no-cache"})
 
     return app

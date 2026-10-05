@@ -103,3 +103,16 @@ revoke the Google OAuth grant; revoke that separately in your Google account if 
 Cache checksums are verified before new entries are published. Existing cache entries
 created before this upgrade should be cleared once, while the service is stopped, to
 ensure they were verified by the new writer.
+
+## Frontend API/database upgrade
+
+The frontend API changes add queryable added dates/track ordering, normalized chapter rows,
+conditional progress, and playlist revisions. Follow the backup/stop procedure above.
+Startup backfills existing books once; their added dates are migration dates because the
+old database did not retain discovery timestamps. Publication upserts surviving books.
+
+Deploy the matching frontend build and reload open browser tabs. Progress writes now need
+`base_revision` and `event_id`; whole-playlist replacements need `base_revision`. Old clients
+receive 428 instead of overwriting newer state. Rollback requires restoring the matching
+pre-upgrade database backup because chapter storage changes. See [API.md](API.md) for the
+current contracts and compatibility boundaries.
